@@ -5,3 +5,5 @@ tester.*
 .env
 .vscode
 data/*
+
+*.pyc

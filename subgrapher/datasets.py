@@ -5,7 +5,7 @@ import lmdb
 import numpy as np
 import json
 import pickle
-import dgl
+# import dgl
 import torch
 from torch.utils.data import Dataset
 from .data_utils import process_files, save_to_file, plot_rel_dist
