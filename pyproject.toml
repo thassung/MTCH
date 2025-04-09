@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "MTCH"
+version = "0.1.0"
+description = "A Python package for graph subgraphing designed for link prediction"
+authors = ["Nathas Sung <thassung@gmail.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+matplotlib = "^3.10.1"
+networkx = "^3.4.2"
+scikit-learn = "^1.6.1"
+pandas = "^2.2.3"
+torch = "^2.6.0"
+dgl = "^2.2.1"
+lmdb = "^1.6.2"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api" 

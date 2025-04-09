@@ -1,0 +1,7 @@
+.results
+tester.*
+*.log
+.venv
+.env
+.vscode
+data/*
