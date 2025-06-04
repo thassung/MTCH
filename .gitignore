@@ -4,6 +4,8 @@ tester.*
 .venv
 .env
 .vscode
-data/*
+
 
 *.pyc
+
+*.old

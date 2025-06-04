@@ -12,12 +12,18 @@ matplotlib = "^3.10.1"
 networkx = "^3.4.2"
 scikit-learn = "^1.6.1"
 pandas = "^2.2.3"
-torch = "^2.6.0"
-dgl = "^2.2.1"
 lmdb = "^1.6.2"
+torch = {version = "^2.7.1+cu128", source = "pytorch-gpu"}
+tqdm = "^4.67.1"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
+
+
+[[tool.poetry.source]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
 
 [build-system]
 requires = ["poetry-core"]
