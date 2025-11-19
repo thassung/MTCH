@@ -5,7 +5,6 @@ tester.*
 .env
 .vscode
 
-
 *.pyc
 
 *.old
