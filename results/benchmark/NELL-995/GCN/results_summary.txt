@@ -1,0 +1,16 @@
+Model: GCN
+Dataset: NELL-995
+Parameters: 296,449
+Training Time: 20.70s
+
+Test Results:
+  MRR:     0.0210
+  AUC:     0.4962
+  AP:      0.0098
+  hits@1:  0.0074
+  hits@10:  0.0140
+  hits@100:  0.9659
+  hits@3:  0.0093
+  hits@50:  0.0347
+
+Best Validation MRR: 0.0217

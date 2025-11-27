@@ -1,0 +1,13 @@
+{
+  "model": "SAGE",
+  "dataset": "FB15K237",
+  "num_params": 460289,
+  "hyperparameters": {
+    "hidden_channels": 256,
+    "num_layers": 3,
+    "dropout": 0.3,
+    "epochs": 100,
+    "lr": 0.001,
+    "batch_size": 65536
+  }
+}

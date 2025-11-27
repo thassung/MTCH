@@ -1,0 +1,16 @@
+Model: GAT
+Dataset: FB15K237
+Parameters: 1,580,545
+Training Time: 165.67s
+
+Test Results:
+  MRR:     0.1356
+  AUC:     0.7030
+  AP:      0.0252
+  hits@1:  0.0421
+  hits@10:  0.3407
+  hits@100:  0.9997
+  hits@3:  0.1199
+  hits@50:  0.8128
+
+Best Validation MRR: 0.5190

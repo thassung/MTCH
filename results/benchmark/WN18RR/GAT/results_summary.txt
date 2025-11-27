@@ -1,0 +1,16 @@
+Model: GAT
+Dataset: WN18RR
+Parameters: 1,580,545
+Training Time: 49.11s
+
+Test Results:
+  MRR:     0.8611
+  AUC:     0.9647
+  AP:      0.8250
+  hits@1:  0.8174
+  hits@10:  0.9294
+  hits@100:  0.9991
+  hits@3:  0.8935
+  hits@50:  0.9729
+
+Best Validation MRR: 0.8591

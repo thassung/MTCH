@@ -1,0 +1,111 @@
+================================================================================
+LINK PREDICTION BENCHMARK - FULL RESULTS
+================================================================================
+
+Run Date: 2025-11-27 07:44:02
+Total Runtime: 0.14 hours (496.6s)
+Device: cuda
+Configuration:
+  feature_method: random
+  feature_dim: 128
+  hidden_channels: 256
+  num_layers: 3
+  dropout: 0.3
+  epochs: 100
+  batch_size: 65536
+  lr: 0.001
+  eval_steps: 10
+  device: cuda
+
+================================================================================
+RESULTS BY DATASET
+================================================================================
+
+
+FB15K237:
+--------------------------------------------------------------------------------
+  GAT:
+    Parameters:    1,580,545
+    Training Time: 165.67s
+    MRR:           0.1356
+    AUC:           0.7030
+    Hits@10:       0.3407
+
+  GCN:
+    Parameters:    296,449
+    Training Time: 46.97s
+    MRR:           0.0100
+    AUC:           0.5023
+    Hits@10:       0.0000
+
+  SAGE:
+    Parameters:    460,289
+    Training Time: 58.78s
+    MRR:           0.3327
+    AUC:           0.8660
+    Hits@10:       0.6428
+
+
+NELL-995:
+--------------------------------------------------------------------------------
+  GAT:
+    Parameters:    1,580,545
+    Training Time: 67.37s
+    MRR:           0.7695
+    AUC:           0.9629
+    Hits@10:       0.9104
+
+  GCN:
+    Parameters:    296,449
+    Training Time: 20.70s
+    MRR:           0.0210
+    AUC:           0.4962
+    Hits@10:       0.0140
+
+  SAGE:
+    Parameters:    460,289
+    Training Time: 25.95s
+    MRR:           0.7432
+    AUC:           0.9750
+    Hits@10:       0.8964
+
+
+WN18RR:
+--------------------------------------------------------------------------------
+  GAT:
+    Parameters:    1,580,545
+    Training Time: 49.11s
+    MRR:           0.8611
+    AUC:           0.9647
+    Hits@10:       0.9294
+
+  GCN:
+    Parameters:    296,449
+    Training Time: 17.97s
+    MRR:           0.1726
+    AUC:           0.6023
+    Hits@10:       0.2923
+
+  SAGE:
+    Parameters:    460,289
+    Training Time: 18.96s
+    MRR:           0.8004
+    AUC:           0.9546
+    Hits@10:       0.8933
+
+
+================================================================================
+BEST RESULTS
+================================================================================
+
+Best MRR: GAT on WN18RR (0.8611)
+Fastest:  GCN on WN18RR (18.0s)
+
+================================================================================
+FILES GENERATED
+================================================================================
+
+- comparison_table.csv: All results in CSV format
+- full_results.json: Complete results in JSON
+- visualizations/: Comparison plots
+- {dataset}/{model}/: Individual experiment results

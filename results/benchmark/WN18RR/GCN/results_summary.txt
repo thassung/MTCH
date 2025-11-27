@@ -1,0 +1,16 @@
+Model: GCN
+Dataset: WN18RR
+Parameters: 296,449
+Training Time: 17.97s
+
+Test Results:
+  MRR:     0.1726
+  AUC:     0.6023
+  AP:      0.0434
+  hits@1:  0.0998
+  hits@10:  0.2923
+  hits@100:  0.9376
+  hits@3:  0.1771
+  hits@50:  0.6475
+
+Best Validation MRR: 0.1777

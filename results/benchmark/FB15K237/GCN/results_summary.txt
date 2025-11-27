@@ -1,0 +1,16 @@
+Model: GCN
+Dataset: FB15K237
+Parameters: 296,449
+Training Time: 46.97s
+
+Test Results:
+  MRR:     0.0100
+  AUC:     0.5023
+  AP:      0.0099
+  hits@1:  0.0000
+  hits@10:  0.0000
+  hits@100:  0.4231
+  hits@3:  0.0000
+  hits@50:  0.0000
+
+Best Validation MRR: 0.0100

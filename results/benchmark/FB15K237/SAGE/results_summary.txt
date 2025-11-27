@@ -1,0 +1,16 @@
+Model: SAGE
+Dataset: FB15K237
+Parameters: 460,289
+Training Time: 58.78s
+
+Test Results:
+  MRR:     0.3327
+  AUC:     0.8660
+  AP:      0.0736
+  hits@1:  0.1931
+  hits@10:  0.6428
+  hits@100:  1.0000
+  hits@3:  0.3705
+  hits@50:  0.9510
+
+Best Validation MRR: 0.6054
