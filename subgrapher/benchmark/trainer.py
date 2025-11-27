@@ -1,17 +1,20 @@
 """
 Training pipeline for link prediction models.
+Includes early stopping, learning rate scheduling, gradient clipping, and checkpointing.
 """
 
 import torch
+import torch.nn as nn
 import time
+import copy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from .evaluator import evaluate_link_prediction, print_evaluation_results
 
 
-def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, device):
+def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, device, grad_clip=None):
     """
-    Train for one epoch following PS2 style.
+    Train for one epoch with gradient clipping.
     
     Args:
         encoder: GNN encoder model
@@ -21,6 +24,7 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
         optimizer: Optimizer
         batch_size: Batch size
         device: Device (cpu/cuda)
+        grad_clip: Max gradient norm (None to disable)
     Returns:
         Average loss for the epoch
     """
@@ -56,6 +60,14 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
         # Total loss
         loss = pos_loss + neg_loss
         loss.backward()
+        
+        # Gradient clipping (prevents exploding gradients)
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(predictor.parameters()), 
+                grad_clip
+            )
+        
         optimizer.step()
         
         num_examples = pos_out.size(0)
@@ -66,22 +78,29 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
 
 
 def train_model(encoder, predictor, data, split_edge, 
-                epochs=100, batch_size=65536, lr=0.001, 
-                eval_steps=10, device='cpu', verbose=True):
+                epochs=500, batch_size=65536, lr=0.001, 
+                eval_steps=5, device='cpu', verbose=True,
+                patience=20, min_delta=0.0001, weight_decay=0.0,
+                lr_scheduler='reduce_on_plateau', grad_clip=1.0):
     """
-    Complete training loop with evaluation.
+    Complete training loop with early stopping, LR scheduling, and checkpointing.
     
     Args:
         encoder: GNN encoder model
         predictor: Link predictor model
         data: PyG Data object
         split_edge: Dictionary with edge splits
-        epochs: Number of training epochs
+        epochs: Maximum training epochs (with early stopping, may stop earlier)
         batch_size: Batch size
-        lr: Learning rate
+        lr: Initial learning rate
         eval_steps: Evaluate every N epochs
         device: Device (cpu/cuda)
         verbose: Print progress
+        patience: Early stopping patience (epochs without improvement)
+        min_delta: Minimum improvement to count as progress
+        weight_decay: L2 regularization strength
+        lr_scheduler: 'reduce_on_plateau', 'cosine', or None
+        grad_clip: Gradient clipping max norm (None to disable)
     Returns:
         Dictionary with training history
     """
@@ -90,38 +109,58 @@ def train_model(encoder, predictor, data, split_edge,
     predictor = predictor.to(device)
     data = data.to(device)
     
-    # Optimizer
+    # Optimizer with weight decay (L2 regularization)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(predictor.parameters()),
-        lr=lr
+        lr=lr,
+        weight_decay=weight_decay
     )
+    
+    # Learning rate scheduler
+    scheduler = None
+    if lr_scheduler == 'reduce_on_plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=10
+        )
+    elif lr_scheduler == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=lr * 0.01
+        )
     
     # Training history
     history = {
         'train_loss': [],
         'val_results': [],
         'epoch_times': [],
+        'learning_rates': [],
         'best_val_mrr': 0.0,
-        'best_epoch': 0
+        'best_epoch': 0,
+        'stopped_early': False,
+        'stop_reason': None
     }
+    
+    # Early stopping tracking
+    best_val_mrr = 0.0
+    epochs_without_improvement = 0
+    best_model_state = None
     
     # Training loop
     start_time = time.time()
-    
     iterator = tqdm(range(1, epochs + 1), desc='Training') if verbose else range(1, epochs + 1)
     
     for epoch in iterator:
         epoch_start = time.time()
         
-        # Train
+        # Train one epoch
         loss = train_epoch(encoder, predictor, data, split_edge, 
-                          optimizer, batch_size, device)
+                          optimizer, batch_size, device, grad_clip=grad_clip)
         
         epoch_time = time.time() - epoch_start
         history['train_loss'].append(loss)
         history['epoch_times'].append(epoch_time)
+        history['learning_rates'].append(optimizer.param_groups[0]['lr'])
         
-        # Evaluate
+        # Evaluate on validation set
         if epoch % eval_steps == 0 or epoch == epochs:
             val_results = evaluate_link_prediction(
                 encoder, predictor, data, split_edge, 
@@ -129,33 +168,82 @@ def train_model(encoder, predictor, data, split_edge,
             )
             history['val_results'].append(val_results)
             
-            # Track best model
-            if val_results['mrr'] > history['best_val_mrr']:
-                history['best_val_mrr'] = val_results['mrr']
-                history['best_epoch'] = epoch
+            current_val_mrr = val_results['mrr']
             
+            # Check for improvement
+            if current_val_mrr > best_val_mrr + min_delta:
+                # Significant improvement
+                best_val_mrr = current_val_mrr
+                history['best_val_mrr'] = best_val_mrr
+                history['best_epoch'] = epoch
+                epochs_without_improvement = 0
+                
+                # Save best model checkpoint
+                best_model_state = {
+                    'encoder': copy.deepcopy(encoder.state_dict()),
+                    'predictor': copy.deepcopy(predictor.state_dict())
+                }
+            else:
+                # No improvement
+                epochs_without_improvement += eval_steps
+            
+            # Learning rate scheduling
+            if scheduler is not None:
+                if lr_scheduler == 'reduce_on_plateau':
+                    scheduler.step(current_val_mrr)
+                else:
+                    scheduler.step()
+            
+            # Progress display
             if verbose:
                 iterator.set_postfix({
                     'loss': f'{loss:.4f}',
-                    'val_mrr': f'{val_results["mrr"]:.4f}',
-                    'val_h@10': f'{val_results.get("hits@10", 0):.4f}'
+                    'val_mrr': f'{current_val_mrr:.4f}',
+                    'best': f'{best_val_mrr:.4f}',
+                    'patience': f'{epochs_without_improvement}/{patience}',
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                 })
+            
+            # Early stopping check
+            if epochs_without_improvement >= patience:
+                history['stopped_early'] = True
+                history['stop_reason'] = f'No improvement for {patience} epochs'
+                if verbose:
+                    print(f"\n[Early Stop] No improvement for {patience} epochs")
+                    print(f"Best MRR: {best_val_mrr:.4f} at epoch {history['best_epoch']}")
+                break
     
     total_time = time.time() - start_time
     history['total_time'] = total_time
     
+    # Restore best model
+    if best_model_state is not None:
+        encoder.load_state_dict(best_model_state['encoder'])
+        predictor.load_state_dict(best_model_state['predictor'])
+        if verbose:
+            print(f"[Checkpoint] Restored best model from epoch {history['best_epoch']}")
+    
+    # Final summary
     if verbose:
-        print(f"\nTraining completed in {total_time:.2f}s")
-        print(f"Best validation MRR: {history['best_val_mrr']:.4f} at epoch {history['best_epoch']}")
+        print(f"\n{'='*60}")
+        print(f"Training Summary:")
+        print(f"  Total time: {total_time:.2f}s")
+        print(f"  Epochs run: {epoch}/{epochs}")
+        print(f"  Best val MRR: {history['best_val_mrr']:.4f} (epoch {history['best_epoch']})")
+        if history['stopped_early']:
+            print(f"  Early stopped: {history['stop_reason']}")
+        print(f"{'='*60}")
     
     return history
 
 
 def benchmark_model(model_name, encoder, predictor, data, split_edge,
-                    epochs=100, batch_size=65536, lr=0.001,
-                    eval_steps=10, device='cpu'):
+                    epochs=500, batch_size=65536, lr=0.001,
+                    eval_steps=5, device='cpu', patience=20, 
+                    weight_decay=1e-5, lr_scheduler='reduce_on_plateau',
+                    grad_clip=1.0):
     """
-    Complete benchmark for a single model.
+    Complete benchmark for a single model with early stopping.
     
     Args:
         model_name: Name of the model (for display)
@@ -163,11 +251,15 @@ def benchmark_model(model_name, encoder, predictor, data, split_edge,
         predictor: Link predictor
         data: PyG Data object
         split_edge: Dictionary with edge splits
-        epochs: Number of training epochs
+        epochs: Maximum training epochs (early stopping may end sooner)
         batch_size: Batch size
-        lr: Learning rate
+        lr: Initial learning rate
         eval_steps: Evaluate every N epochs
         device: Device
+        patience: Early stopping patience
+        weight_decay: L2 regularization
+        lr_scheduler: Learning rate scheduler type
+        grad_clip: Gradient clipping max norm
     Returns:
         Dictionary with complete benchmark results
     """
@@ -179,16 +271,21 @@ def benchmark_model(model_name, encoder, predictor, data, split_edge,
     num_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
     num_params += sum(p.numel() for p in predictor.parameters() if p.requires_grad)
     print(f"Total parameters: {num_params:,}")
+    print(f"Early stopping: enabled (patience={patience})")
+    print(f"Learning rate: {lr} (scheduler={lr_scheduler})")
+    print(f"Regularization: weight_decay={weight_decay}, grad_clip={grad_clip}")
     
-    # Train
+    # Train with early stopping
     history = train_model(
         encoder, predictor, data, split_edge,
         epochs=epochs, batch_size=batch_size, lr=lr,
-        eval_steps=eval_steps, device=device, verbose=True
+        eval_steps=eval_steps, device=device, verbose=True,
+        patience=patience, weight_decay=weight_decay,
+        lr_scheduler=lr_scheduler, grad_clip=grad_clip
     )
     
-    # Final test evaluation
-    print(f"\nEvaluating on test set...")
+    # Final test evaluation (uses best checkpoint)
+    print(f"\nEvaluating on test set (best checkpoint)...")
     test_results = evaluate_link_prediction(
         encoder, predictor, data, split_edge,
         split='test', batch_size=batch_size
@@ -201,6 +298,8 @@ def benchmark_model(model_name, encoder, predictor, data, split_edge,
         'num_params': num_params,
         'train_time': history['total_time'],
         'best_val_mrr': history['best_val_mrr'],
+        'best_epoch': history['best_epoch'],
+        'stopped_early': history['stopped_early'],
         'test_results': test_results,
         'history': history
     }

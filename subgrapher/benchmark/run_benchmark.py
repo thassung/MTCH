@@ -59,14 +59,18 @@ def run_benchmark(dataset_path,
                   hidden_channels=256,
                   num_layers=3,
                   dropout=0.3,
-                  epochs=100,
+                  epochs=1500,
                   batch_size=65536,
                   lr=0.001,
-                  eval_steps=10,
+                  eval_steps=5,
+                  patience=20,
+                  weight_decay=1e-5,
+                  lr_scheduler='reduce_on_plateau',
+                  grad_clip=1.0,
                   device='cuda',
                   models_to_run=None):
     """
-    Run complete benchmark on dataset.
+    Run complete benchmark on dataset with early stopping.
     
     Args:
         dataset_path: Path to dataset .txt file
@@ -75,10 +79,14 @@ def run_benchmark(dataset_path,
         hidden_channels: Hidden dimension for GNN
         num_layers: Number of GNN layers
         dropout: Dropout rate
-        epochs: Training epochs
+        epochs: Max training epochs (early stopping may end sooner)
         batch_size: Batch size
-        lr: Learning rate
-        eval_steps: Evaluation frequency
+        lr: Initial learning rate
+        eval_steps: Evaluation frequency (epochs)
+        patience: Early stopping patience
+        weight_decay: L2 regularization
+        lr_scheduler: 'reduce_on_plateau', 'cosine', or None
+        grad_clip: Gradient clipping max norm
         device: 'cpu' or 'cuda'
         models_to_run: List of model names or None for all
     Returns:
@@ -140,11 +148,13 @@ def run_benchmark(dataset_path,
         encoder.reset_parameters()
         predictor.reset_parameters()
         
-        # Benchmark
+        # Benchmark with early stopping
         result = benchmark_model(
             model_name, encoder, predictor, data, split_edge,
             epochs=epochs, batch_size=batch_size, lr=lr,
-            eval_steps=eval_steps, device=device
+            eval_steps=eval_steps, device=device,
+            patience=patience, weight_decay=weight_decay,
+            lr_scheduler=lr_scheduler, grad_clip=grad_clip
         )
         
         results_list.append(result)
@@ -177,14 +187,23 @@ def main():
                        help='Dropout rate')
     
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=500,
+                       help='Max training epochs (early stopping may end sooner)')
     parser.add_argument('--batch_size', type=int, default=65536,
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001,
-                       help='Learning rate')
-    parser.add_argument('--eval_steps', type=int, default=10,
+                       help='Initial learning rate')
+    parser.add_argument('--eval_steps', type=int, default=5,
                        help='Evaluation frequency (epochs)')
+    parser.add_argument('--patience', type=int, default=20,
+                       help='Early stopping patience (epochs)')
+    parser.add_argument('--weight_decay', type=float, default=1e-5,
+                       help='L2 regularization weight decay')
+    parser.add_argument('--lr_scheduler', type=str, default='reduce_on_plateau',
+                       choices=['reduce_on_plateau', 'cosine', 'none'],
+                       help='Learning rate scheduler')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                       help='Gradient clipping max norm (0 to disable)')
     
     # Device
     parser.add_argument('--device', type=str, default='cuda',
@@ -198,6 +217,9 @@ def main():
     args = parser.parse_args()
     
     # Run benchmark
+    lr_sched = None if args.lr_scheduler == 'none' else args.lr_scheduler
+    grad_clip_val = None if args.grad_clip == 0 else args.grad_clip
+    
     results = run_benchmark(
         dataset_path=args.dataset,
         feature_method=args.feature_method,
@@ -209,6 +231,10 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         eval_steps=args.eval_steps,
+        patience=args.patience,
+        weight_decay=args.weight_decay,
+        lr_scheduler=lr_sched,
+        grad_clip=grad_clip_val,
         device=args.device,
         models_to_run=args.models
     )

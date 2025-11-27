@@ -2,8 +2,8 @@
 LINK PREDICTION BENCHMARK - FULL RESULTS
 ================================================================================
 
-Run Date: 2025-11-27 07:44:02
-Total Runtime: 0.14 hours (496.6s)
+Run Date: 2025-11-27 10:33:05
+Total Runtime: 2.29 hours (8227.7s)
 Device: cuda
 Configuration:
   feature_method: random
@@ -11,10 +11,14 @@ Configuration:
   hidden_channels: 256
   num_layers: 3
   dropout: 0.3
-  epochs: 100
+  epochs: 3000
   batch_size: 65536
   lr: 0.001
-  eval_steps: 10
+  eval_steps: 5
+  patience: 200
+  weight_decay: 1e-05
+  lr_scheduler: reduce_on_plateau
+  grad_clip: 1.0
   device: cuda
 
 ================================================================================
@@ -26,80 +30,80 @@ FB15K237:
 --------------------------------------------------------------------------------
   GAT:
     Parameters:    1,580,545
-    Training Time: 165.67s
-    MRR:           0.1356
-    AUC:           0.7030
-    Hits@10:       0.3407
+    Training Time: 2877.44s
+    MRR:           0.7187
+    AUC:           0.9865
+    Hits@10:       0.9431
 
   GCN:
     Parameters:    296,449
-    Training Time: 46.97s
-    MRR:           0.0100
-    AUC:           0.5023
-    Hits@10:       0.0000
+    Training Time: 154.98s
+    MRR:           0.0105
+    AUC:           0.4979
+    Hits@10:       0.0008
 
   SAGE:
     Parameters:    460,289
-    Training Time: 58.78s
-    MRR:           0.3327
-    AUC:           0.8660
-    Hits@10:       0.6428
+    Training Time: 1430.95s
+    MRR:           0.7391
+    AUC:           0.9880
+    Hits@10:       0.9413
 
 
 NELL-995:
 --------------------------------------------------------------------------------
   GAT:
     Parameters:    1,580,545
-    Training Time: 67.37s
-    MRR:           0.7695
-    AUC:           0.9629
-    Hits@10:       0.9104
+    Training Time: 949.38s
+    MRR:           0.8161
+    AUC:           0.9667
+    Hits@10:       0.9369
 
   GCN:
     Parameters:    296,449
-    Training Time: 20.70s
-    MRR:           0.0210
-    AUC:           0.4962
-    Hits@10:       0.0140
+    Training Time: 398.04s
+    MRR:           0.5221
+    AUC:           0.9046
+    Hits@10:       0.6611
 
   SAGE:
     Parameters:    460,289
-    Training Time: 25.95s
-    MRR:           0.7432
-    AUC:           0.9750
-    Hits@10:       0.8964
+    Training Time: 559.95s
+    MRR:           0.8523
+    AUC:           0.9840
+    Hits@10:       0.9652
 
 
 WN18RR:
 --------------------------------------------------------------------------------
   GAT:
     Parameters:    1,580,545
-    Training Time: 49.11s
-    MRR:           0.8611
-    AUC:           0.9647
-    Hits@10:       0.9294
+    Training Time: 726.07s
+    MRR:           0.9019
+    AUC:           0.9758
+    Hits@10:       0.9480
 
   GCN:
     Parameters:    296,449
-    Training Time: 17.97s
-    MRR:           0.1726
-    AUC:           0.6023
-    Hits@10:       0.2923
+    Training Time: 713.56s
+    MRR:           0.7962
+    AUC:           0.9771
+    Hits@10:       0.9399
 
   SAGE:
     Parameters:    460,289
-    Training Time: 18.96s
-    MRR:           0.8004
-    AUC:           0.9546
-    Hits@10:       0.8933
+    Training Time: 392.07s
+    MRR:           0.8950
+    AUC:           0.9654
+    Hits@10:       0.9368
 
 
 ================================================================================
 BEST RESULTS
 ================================================================================
 
-Best MRR: GAT on WN18RR (0.8611)
-Fastest:  GCN on WN18RR (18.0s)
+Best MRR: GAT on WN18RR (0.9019)
+Fastest:  GCN on FB15K237 (155.0s)
 
 ================================================================================
 FILES GENERATED

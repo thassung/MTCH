@@ -1,16 +1,19 @@
 Model: SAGE
 Dataset: NELL-995
 Parameters: 460,289
-Training Time: 25.95s
+
+Training:
+  Time: 559.95s
+  Best Epoch: 1255
+  Early Stopped: Yes
+  Best Val MRR: 0.8569
 
 Test Results:
-  MRR:     0.7432
-  AUC:     0.9750
-  AP:      0.5989
-  hits@1:  0.6603
-  hits@10:  0.8964
-  hits@100:  1.0000
-  hits@3:  0.7931
-  hits@50:  0.9945
-
-Best Validation MRR: 0.7463
+  MRR:     0.8523
+  AUC:     0.9840
+  AP:      0.7871
+  hits@1:  0.7792
+  hits@10:  0.9652
+  hits@100:  0.9996
+  hits@3:  0.9153
+  hits@50:  0.9917

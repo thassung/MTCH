@@ -25,17 +25,21 @@ import numpy as np
 from .run_benchmark import run_benchmark
 
 
-# Default configuration
+# Default configuration with early stopping
 DEFAULT_CONFIG = {
     'feature_method': 'random',
     'feature_dim': 128,
     'hidden_channels': 256,
     'num_layers': 3,
     'dropout': 0.3,
-    'epochs': 100,
-    'batch_size': 65536,
+    'epochs': 3000,             # Max epochs
+    'batch_size': 65536,        # Batch size 2^16
     'lr': 0.001,
-    'eval_steps': 10,
+    'eval_steps': 5,            # More frequent evaluation for early stopping
+    'patience': 200,            # Early stopping patience
+    'weight_decay': 1e-5,       # L2 regularization
+    'lr_scheduler': 'reduce_on_plateau',  # Learning rate scheduling
+    'grad_clip': 1.0,           # Gradient clipping
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
@@ -61,7 +65,7 @@ def setup_directories():
 
 def save_config(config, output_path):
     """Save configuration to JSON file."""
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
 
 
@@ -87,28 +91,42 @@ def save_experiment_results(results, dataset_name, base_dir):
             'model': model_name,
             'dataset': dataset_name,
             'num_params': result['num_params'],
+            'training_info': {
+                'best_epoch': result.get('best_epoch', 0),
+                'stopped_early': result.get('stopped_early', False),
+                'total_time_seconds': result['train_time']
+            },
             'hyperparameters': {
                 'hidden_channels': DEFAULT_CONFIG['hidden_channels'],
                 'num_layers': DEFAULT_CONFIG['num_layers'],
                 'dropout': DEFAULT_CONFIG['dropout'],
-                'epochs': DEFAULT_CONFIG['epochs'],
-                'lr': DEFAULT_CONFIG['lr'],
-                'batch_size': DEFAULT_CONFIG['batch_size']
+                'max_epochs': DEFAULT_CONFIG['epochs'],
+                'patience': DEFAULT_CONFIG['patience'],
+                'lr_initial': DEFAULT_CONFIG['lr'],
+                'lr_scheduler': DEFAULT_CONFIG['lr_scheduler'],
+                'weight_decay': DEFAULT_CONFIG['weight_decay'],
+                'grad_clip': DEFAULT_CONFIG['grad_clip'],
+                'batch_size': DEFAULT_CONFIG['batch_size'],
+                'eval_steps': DEFAULT_CONFIG['eval_steps']
             }
         }, config_path)
         
         # Save metrics
         metrics_path = os.path.join(model_dir, 'metrics.json')
-        with open(metrics_path, 'w') as f:
+        with open(metrics_path, 'w', encoding='utf-8') as f:
             json.dump(result['test_results'], f, indent=2)
         
         # Save summary
         summary_path = os.path.join(model_dir, 'results_summary.txt')
-        with open(summary_path, 'w') as f:
+        with open(summary_path, 'w', encoding='utf-8') as f:
             f.write(f"Model: {model_name}\n")
             f.write(f"Dataset: {dataset_name}\n")
             f.write(f"Parameters: {result['num_params']:,}\n")
-            f.write(f"Training Time: {result['train_time']:.2f}s\n")
+            f.write(f"\nTraining:\n")
+            f.write(f"  Time: {result['train_time']:.2f}s\n")
+            f.write(f"  Best Epoch: {result.get('best_epoch', 'N/A')}\n")
+            f.write(f"  Early Stopped: {'Yes' if result.get('stopped_early', False) else 'No'}\n")
+            f.write(f"  Best Val MRR: {result['best_val_mrr']:.4f}\n")
             f.write(f"\nTest Results:\n")
             f.write(f"  MRR:     {result['test_results']['mrr']:.4f}\n")
             f.write(f"  AUC:     {result['test_results']['auc']:.4f}\n")
@@ -116,7 +134,6 @@ def save_experiment_results(results, dataset_name, base_dir):
             for key in sorted(result['test_results'].keys()):
                 if key.startswith('hits@'):
                     f.write(f"  {key}:  {result['test_results'][key]:.4f}\n")
-            f.write(f"\nBest Validation MRR: {result['best_val_mrr']:.4f}\n")
         
         # Save training curve if history available
         if 'history' in result and result['history']:
@@ -184,7 +201,7 @@ def run_single_dataset(dataset_name, dataset_path, config, base_dir):
         log_buffer = io.StringIO()
         
         with redirect_stdout(log_buffer):
-            # Call existing run_benchmark function - REUSE!
+            # Call existing run_benchmark function with early stopping
             results = run_benchmark(
                 dataset_path=dataset_path,
                 feature_method=config['feature_method'],
@@ -196,12 +213,16 @@ def run_single_dataset(dataset_name, dataset_path, config, base_dir):
                 batch_size=config['batch_size'],
                 lr=config['lr'],
                 eval_steps=config['eval_steps'],
+                patience=config['patience'],
+                weight_decay=config['weight_decay'],
+                lr_scheduler=config['lr_scheduler'],
+                grad_clip=config['grad_clip'],
                 device=config['device'],
                 models_to_run=['GCN', 'SAGE', 'GAT']
             )
         
         # Save log
-        with open(log_path, 'w') as f:
+        with open(log_path, 'w', encoding='utf-8') as f:
             f.write(log_buffer.getvalue())
         
         # Also print to console
@@ -221,7 +242,7 @@ def run_single_dataset(dataset_name, dataset_path, config, base_dir):
         print(error_msg)
         
         # Save error log
-        with open(log_path, 'w') as f:
+        with open(log_path, 'w', encoding='utf-8') as f:
             f.write(error_msg)
         
         return None
@@ -375,7 +396,7 @@ def create_summary_report(all_results, base_dir, total_time):
     """Create human-readable summary report."""
     report_path = os.path.join(base_dir, 'summary_report.txt')
     
-    with open(report_path, 'w') as f:
+    with open(report_path, 'w', encoding='utf-8') as f:
         f.write("="*80 + "\n")
         f.write("LINK PREDICTION BENCHMARK - FULL RESULTS\n")
         f.write("="*80 + "\n\n")
@@ -489,7 +510,7 @@ def run_full_benchmark(config=None):
     
     # Save full results JSON
     json_path = os.path.join(base_dir, 'full_results.json')
-    with open(json_path, 'w') as f:
+    with open(json_path, 'w', encoding='utf-8') as f:
         # Convert results to serializable format
         serializable_results = {}
         for dataset_name, results in all_results.items():
@@ -536,21 +557,17 @@ def main():
     parser = argparse.ArgumentParser(
         description='Run full benchmark: 3 models × 3 datasets'
     )
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Training epochs (default: 100)')
-    parser.add_argument('--device', type=str, default=None,
-                       help='Device: cuda or cpu (default: auto-detect)')
-    parser.add_argument('--batch_size', type=int, default=65536,
-                       help='Batch size (default: 65536)')
+
+    # Add custom arguments here
+    ###
     
     args = parser.parse_args()
     
     # Update config
     config = DEFAULT_CONFIG.copy()
-    config['epochs'] = args.epochs
-    config['batch_size'] = args.batch_size
-    if args.device:
-        config['device'] = args.device
+    for key, value in vars(args).items():
+        if value is not None:    
+            config[key] = value
     
     # Run benchmark
     run_full_benchmark(config)

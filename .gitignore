@@ -8,3 +8,5 @@ tester.*
 *.pyc
 
 *.old
+
+*.md

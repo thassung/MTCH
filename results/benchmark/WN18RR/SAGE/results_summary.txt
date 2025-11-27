@@ -1,16 +1,19 @@
 Model: SAGE
 Dataset: WN18RR
 Parameters: 460,289
-Training Time: 18.96s
+
+Training:
+  Time: 392.07s
+  Best Epoch: 1210
+  Early Stopped: Yes
+  Best Val MRR: 0.8936
 
 Test Results:
-  MRR:     0.8004
-  AUC:     0.9546
-  AP:      0.7417
-  hits@1:  0.7497
-  hits@10:  0.8933
-  hits@100:  0.9996
-  hits@3:  0.8270
-  hits@50:  0.9678
-
-Best Validation MRR: 0.8007
+  MRR:     0.8950
+  AUC:     0.9654
+  AP:      0.8749
+  hits@1:  0.8678
+  hits@10:  0.9368
+  hits@100:  0.9993
+  hits@3:  0.9133
+  hits@50:  0.9754

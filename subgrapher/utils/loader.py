@@ -28,5 +28,8 @@ def load_txt_to_pyg(path):
     edge_index = torch.tensor(
         [list(src) + list(dst), list(dst) + list(src)], dtype=torch.long
     )
-    data = Data(edge_index=edge_index)
+    
+    # Create Data object with explicit num_nodes (suppresses PyG warning)
+    num_nodes = len(node2idx)
+    data = Data(edge_index=edge_index, num_nodes=num_nodes)
     return data, node2idx, idx2node

@@ -1,16 +1,19 @@
 Model: GAT
 Dataset: NELL-995
 Parameters: 1,580,545
-Training Time: 67.37s
+
+Training:
+  Time: 949.38s
+  Best Epoch: 985
+  Early Stopped: Yes
+  Best Val MRR: 0.8205
 
 Test Results:
-  MRR:     0.7695
-  AUC:     0.9629
-  AP:      0.6696
-  hits@1:  0.6869
-  hits@10:  0.9104
-  hits@100:  0.9992
-  hits@3:  0.8276
-  hits@50:  0.9768
-
-Best Validation MRR: 0.7704
+  MRR:     0.8161
+  AUC:     0.9667
+  AP:      0.7500
+  hits@1:  0.7407
+  hits@10:  0.9369
+  hits@100:  0.9991
+  hits@3:  0.8781
+  hits@50:  0.9781
