@@ -17,20 +17,20 @@ Test edges: 23660
 Benchmarking GCN
 ============================================================
 Total parameters: 296,449
-Early stopping: enabled (patience=200)
-Learning rate: 0.001 (scheduler=reduce_on_plateau)
+Early stopping: enabled (patience=30)
+Learning rate: 0.005 (scheduler=reduce_on_plateau)
 Regularization: weight_decay=1e-05, grad_clip=1.0
 
-[Early Stop] No improvement for 200 epochs
-Best MRR: 0.5235 at epoch 1035
-[Checkpoint] Restored best model from epoch 1035
+[Early Stop] No improvement for 30 epochs
+Best MRR: 0.2825 at epoch 20
+[Checkpoint] Restored best model from epoch 20
 
 ============================================================
 Training Summary:
-  Total time: 398.04s
-  Epochs run: 1235/3000
-  Best val MRR: 0.5235 (epoch 1035)
-  Early stopped: No improvement for 200 epochs
+  Total time: 14.60s
+  Epochs run: 50/500
+  Best val MRR: 0.2825 (epoch 20)
+  Early stopped: No improvement for 30 epochs
 ============================================================
 
 Evaluating on test set (best checkpoint)...
@@ -38,34 +38,34 @@ Evaluating on test set (best checkpoint)...
 ============================================================
 GCN - Test Set Results
 ============================================================
-MRR:             0.5221
-AUC:             0.9046
-AP:              0.2847
-Hit@1  :         0.4208
-Hit@10 :         0.6611
-Hit@100:         0.9976
-Hit@3  :         0.5928
-Hit@50 :         0.9135
+MRR:             0.2817
+AUC:             0.6710
+AP:              0.0206
+Hit@1  :         0.2114
+Hit@10 :         0.3996
+Hit@100:         0.5503
+Hit@3  :         0.3247
+Hit@50 :         0.4030
 ============================================================
 
 ============================================================
 Benchmarking SAGE
 ============================================================
 Total parameters: 460,289
-Early stopping: enabled (patience=200)
-Learning rate: 0.001 (scheduler=reduce_on_plateau)
+Early stopping: enabled (patience=30)
+Learning rate: 0.005 (scheduler=reduce_on_plateau)
 Regularization: weight_decay=1e-05, grad_clip=1.0
 
-[Early Stop] No improvement for 200 epochs
-Best MRR: 0.8569 at epoch 1255
-[Checkpoint] Restored best model from epoch 1255
+[Early Stop] No improvement for 30 epochs
+Best MRR: 0.8131 at epoch 380
+[Checkpoint] Restored best model from epoch 380
 
 ============================================================
 Training Summary:
-  Total time: 559.95s
-  Epochs run: 1455/3000
-  Best val MRR: 0.8569 (epoch 1255)
-  Early stopped: No improvement for 200 epochs
+  Total time: 155.98s
+  Epochs run: 410/500
+  Best val MRR: 0.8131 (epoch 380)
+  Early stopped: No improvement for 30 epochs
 ============================================================
 
 Evaluating on test set (best checkpoint)...
@@ -73,34 +73,34 @@ Evaluating on test set (best checkpoint)...
 ============================================================
 SAGE - Test Set Results
 ============================================================
-MRR:             0.8523
-AUC:             0.9840
-AP:              0.7871
-Hit@1  :         0.7792
-Hit@10 :         0.9652
-Hit@100:         0.9996
-Hit@3  :         0.9153
-Hit@50 :         0.9917
+MRR:             0.8102
+AUC:             0.9781
+AP:              0.7046
+Hit@1  :         0.7266
+Hit@10 :         0.9596
+Hit@100:         0.9956
+Hit@3  :         0.8727
+Hit@50 :         0.9875
 ============================================================
 
 ============================================================
 Benchmarking GAT
 ============================================================
 Total parameters: 1,580,545
-Early stopping: enabled (patience=200)
-Learning rate: 0.001 (scheduler=reduce_on_plateau)
+Early stopping: enabled (patience=30)
+Learning rate: 0.005 (scheduler=reduce_on_plateau)
 Regularization: weight_decay=1e-05, grad_clip=1.0
 
-[Early Stop] No improvement for 200 epochs
-Best MRR: 0.8205 at epoch 985
-[Checkpoint] Restored best model from epoch 985
+[Early Stop] No improvement for 30 epochs
+Best MRR: 0.7952 at epoch 180
+[Checkpoint] Restored best model from epoch 180
 
 ============================================================
 Training Summary:
-  Total time: 949.38s
-  Epochs run: 1185/3000
-  Best val MRR: 0.8205 (epoch 985)
-  Early stopped: No improvement for 200 epochs
+  Total time: 164.10s
+  Epochs run: 210/500
+  Best val MRR: 0.7952 (epoch 180)
+  Early stopped: No improvement for 30 epochs
 ============================================================
 
 Evaluating on test set (best checkpoint)...
@@ -108,14 +108,14 @@ Evaluating on test set (best checkpoint)...
 ============================================================
 GAT - Test Set Results
 ============================================================
-MRR:             0.8161
-AUC:             0.9667
-AP:              0.7500
-Hit@1  :         0.7407
-Hit@10 :         0.9369
-Hit@100:         0.9991
-Hit@3  :         0.8781
-Hit@50 :         0.9781
+MRR:             0.7949
+AUC:             0.9707
+AP:              0.7110
+Hit@1  :         0.7158
+Hit@10 :         0.9302
+Hit@100:         0.9996
+Hit@3  :         0.8544
+Hit@50 :         0.9832
 ============================================================
 
 ==========================================================================================
@@ -123,12 +123,12 @@ LINK PREDICTION BENCHMARK COMPARISON
 ==========================================================================================
 Model        | Params   | Time(s)  | MRR     | AUC     | AP      | H@1     | H@10    | H@50   
 ------------------------------------------------------------------------------------------
-GCN      | 398.0    | 0.5221  | 0.9046  | 0.2847  | 0.4208  | 0.6611  | 0.9135 
-SAGE     | 559.9    | 0.8523  | 0.9840  | 0.7871  | 0.7792  | 0.9652  | 0.9917 
-GAT      | 949.4    | 0.8161  | 0.9667  | 0.7500  | 0.7407  | 0.9369  | 0.9781 
+GCN      | 14.6     | 0.2817  | 0.6710  | 0.0206  | 0.2114  | 0.3996  | 0.4030 
+SAGE     | 156.0    | 0.8102  | 0.9781  | 0.7046  | 0.7266  | 0.9596  | 0.9875 
+GAT      | 164.1    | 0.7949  | 0.9707  | 0.7110  | 0.7158  | 0.9302  | 0.9832 
 ==========================================================================================
 
 Summary:
-  Best MRR:        SAGE (0.8523)
-  Fastest:         GCN (398.0s)
-  Speed ratio:     2.39x
+  Best MRR:        SAGE (0.8102)
+  Fastest:         GCN (14.6s)
+  Speed ratio:     11.24x

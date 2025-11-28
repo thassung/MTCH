@@ -5,7 +5,7 @@ A Python package for graph subgraphing designed for link prediction.
 ## Features
 
 - **Link Prediction Benchmark**: Compare GCN, GraphSAGE, and GAT models
-- **PS2-style Architecture**: Separate GNN encoder + MLP predictor
+- **Two-part Architecture**: Separate GNN encoder + MLP predictor
 - **Comprehensive Metrics**: MRR, Hit@K, AUC-ROC, Average Precision
 - **Production-Ready Training**: Early stopping, LR scheduling, gradient clipping
 - **Plug-and-Play Design**: Ready for future subgrapher integration

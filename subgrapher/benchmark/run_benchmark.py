@@ -6,7 +6,7 @@ Compares GCN, GraphSAGE, and GAT on link prediction task.
 import torch
 import argparse
 
-from .models import GCN, SAGE, GAT, LinkPredictor
+from ..utils.models import GCN, SAGE, GAT, LinkPredictor
 from .data_prep import prepare_link_prediction_data
 from .trainer import benchmark_model
 
@@ -59,11 +59,11 @@ def run_benchmark(dataset_path,
                   hidden_channels=256,
                   num_layers=3,
                   dropout=0.3,
-                  epochs=1500,
+                  epochs=500,
                   batch_size=65536,
-                  lr=0.001,
+                  lr=0.005,
                   eval_steps=5,
-                  patience=20,
+                  patience=30,
                   weight_decay=1e-5,
                   lr_scheduler='reduce_on_plateau',
                   grad_clip=1.0,

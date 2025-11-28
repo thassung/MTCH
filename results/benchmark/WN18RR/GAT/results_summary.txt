@@ -3,17 +3,17 @@ Dataset: WN18RR
 Parameters: 1,580,545
 
 Training:
-  Time: 726.07s
-  Best Epoch: 1025
+  Time: 170.18s
+  Best Epoch: 265
   Early Stopped: Yes
-  Best Val MRR: 0.8991
+  Best Val MRR: 0.8658
 
 Test Results:
-  MRR:     0.9019
-  AUC:     0.9758
-  AP:      0.8814
-  hits@1:  0.8699
-  hits@10:  0.9480
-  hits@100:  0.9999
-  hits@3:  0.9270
-  hits@50:  0.9808
+  MRR:     0.8686
+  AUC:     0.9760
+  AP:      0.8339
+  hits@1:  0.8205
+  hits@10:  0.9416
+  hits@100:  0.9997
+  hits@3:  0.9071
+  hits@50:  0.9822

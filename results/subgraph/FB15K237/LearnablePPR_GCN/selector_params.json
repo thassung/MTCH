@@ -1,0 +1,17 @@
+{
+  "final_params": {
+    "alpha": 0.5,
+    "threshold_percentile": 0.30000001192092896,
+    "sharpness": 100.0,
+    "adaptive_threshold": true
+  },
+  "timestamp": "2025-11-29T05:39:43.083082",
+  "evolution": {
+    "alpha": [
+      0.5
+    ],
+    "threshold": [
+      0.00014727041707374156
+    ]
+  }
+}

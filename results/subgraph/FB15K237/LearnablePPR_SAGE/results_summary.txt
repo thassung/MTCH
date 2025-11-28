@@ -1,0 +1,34 @@
+================================================================================
+LEARNABLE SUBGRAPH EXPERIMENT RESULTS
+================================================================================
+
+Configuration:
+  Dataset: FB15K237
+  Model: LearnablePPR
+  Encoder: SAGE
+  Hidden Dim: 256
+  Num Layers: 3
+  Total Parameters: 460,291
+
+Training:
+  Time: 3654.50s
+  Epochs: N/A
+  Best Epoch: N/A
+  Early Stopped: N/A
+  Best Val Loss: 1.3827
+
+Learned Selector Parameters:
+  Alpha: 0.5021
+  Threshold Percentile: 0.2975
+  Sharpness: 100.00
+
+Subgraph Statistics:
+  Avg Size: 10188.9 nodes
+  Min Size: 10062 nodes
+  Max Size: 10189 nodes
+  Std Dev: 536.1 nodes
+
+Test Results:
+  num_predictions: 54423
+  pred_mean: 0.4963
+  pred_std: 0.0004

@@ -3,17 +3,17 @@ Dataset: FB15K237
 Parameters: 296,449
 
 Training:
-  Time: 154.98s
+  Time: 23.22s
   Best Epoch: 5
   Early Stopped: Yes
-  Best Val MRR: 0.0105
+  Best Val MRR: 0.0100
 
 Test Results:
-  MRR:     0.0105
-  AUC:     0.4979
+  MRR:     0.0100
+  AUC:     0.5023
   AP:      0.0099
-  hits@1:  0.0005
-  hits@10:  0.0008
-  hits@100:  0.0008
-  hits@3:  0.0007
-  hits@50:  0.0008
+  hits@1:  0.0000
+  hits@10:  0.0000
+  hits@100:  0.4194
+  hits@3:  0.0000
+  hits@50:  0.0000

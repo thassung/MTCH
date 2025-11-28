@@ -2,7 +2,7 @@
 import torch
 import networkx as nx
 from torch_geometric.utils import to_networkx, from_networkx
-from loader import load_txt_to_pyg
+from subgrapher.utils.loader import load_txt_to_pyg
 
 def personalized_pagerank(G, seeds, alpha=0.85, weight=None):
     """

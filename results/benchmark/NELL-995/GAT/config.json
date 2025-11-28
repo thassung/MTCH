@@ -3,17 +3,17 @@
   "dataset": "NELL-995",
   "num_params": 1580545,
   "training_info": {
-    "best_epoch": 985,
+    "best_epoch": 180,
     "stopped_early": true,
-    "total_time_seconds": 949.3812100887299
+    "total_time_seconds": 164.10150861740112
   },
   "hyperparameters": {
     "hidden_channels": 256,
     "num_layers": 3,
     "dropout": 0.3,
-    "max_epochs": 3000,
-    "patience": 200,
-    "lr_initial": 0.001,
+    "max_epochs": 500,
+    "patience": 30,
+    "lr_initial": 0.005,
     "lr_scheduler": "reduce_on_plateau",
     "weight_decay": 1e-05,
     "grad_clip": 1.0,

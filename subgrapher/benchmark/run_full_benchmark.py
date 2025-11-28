@@ -32,11 +32,11 @@ DEFAULT_CONFIG = {
     'hidden_channels': 256,
     'num_layers': 3,
     'dropout': 0.3,
-    'epochs': 3000,             # Max epochs
+    'epochs': 500,             # Max epochs
     'batch_size': 65536,        # Batch size 2^16
-    'lr': 0.001,
+    'lr': 0.005,
     'eval_steps': 5,            # More frequent evaluation for early stopping
-    'patience': 200,            # Early stopping patience
+    'patience': 30,            # Early stopping patience
     'weight_decay': 1e-5,       # L2 regularization
     'lr_scheduler': 'reduce_on_plateau',  # Learning rate scheduling
     'grad_clip': 1.0,           # Gradient clipping

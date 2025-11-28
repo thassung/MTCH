@@ -3,17 +3,17 @@ Dataset: NELL-995
 Parameters: 296,449
 
 Training:
-  Time: 398.04s
-  Best Epoch: 1035
+  Time: 14.60s
+  Best Epoch: 20
   Early Stopped: Yes
-  Best Val MRR: 0.5235
+  Best Val MRR: 0.2825
 
 Test Results:
-  MRR:     0.5221
-  AUC:     0.9046
-  AP:      0.2847
-  hits@1:  0.4208
-  hits@10:  0.6611
-  hits@100:  0.9976
-  hits@3:  0.5928
-  hits@50:  0.9135
+  MRR:     0.2817
+  AUC:     0.6710
+  AP:      0.0206
+  hits@1:  0.2114
+  hits@10:  0.3996
+  hits@100:  0.5503
+  hits@3:  0.3247
+  hits@50:  0.4030
