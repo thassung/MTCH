@@ -1,8 +1,6 @@
 """
 AutoLink model adapted for PPR-based architecture search.
-Instead of selecting GNN layers (like PS2), selects PPR teleport scales.
-
-Adapted from PS2's AutoLink_l3 (model.py).
+Instead of selecting GNN layers, selects PPR teleport scales.
 """
 
 import torch

@@ -1,5 +1,5 @@
 """
-Link prediction models following PS2 architecture.
+Link prediction models.
 Imports shared models from utils and adds wrapper class.
 """
 

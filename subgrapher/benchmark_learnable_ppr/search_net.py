@@ -1,6 +1,5 @@
 """
 Architecture search network for PPR configuration selection.
-Ported from PS2's SearchGraph_l31 (model.py lines 1150-1193).
 
 Takes cross-pair representations [batch, num_configs, D] and outputs
 softmax attention weights over configurations.

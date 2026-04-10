@@ -1,6 +1,5 @@
 """
 Bi-level architecture search for learnable PPR configuration.
-Ported from PS2's train_arch() with Hessian-vector products.
 
 Phase 1: Learns per-edge (teleport_u, teleport_v) selection on the full graph.
 """
@@ -24,7 +23,6 @@ def _hessian_vector_product(vector, dalpha_, model, arch_net,
                             r=1e-2):
     """
     Approximate Hessian-vector product for second-order gradient.
-    Ported from PS2's _hessian_vector_product().
 
     Computes:  d^2 L_train / (d_w d_alpha) * v
     using finite difference: [grad_alpha L(w+Rv, alpha) - grad_alpha L(w-Rv, alpha)] / 2R

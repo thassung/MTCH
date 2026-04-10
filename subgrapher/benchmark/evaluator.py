@@ -12,9 +12,7 @@ from torch.utils.data import DataLoader
 @torch.no_grad()
 def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid', 
                               batch_size=65536, K_values=[1, 3, 10, 50, 100]):
-    """
-    Comprehensive evaluation following PS2 style.
-    
+    """    
     Args:
         encoder: GNN encoder model
         predictor: Link predictor model

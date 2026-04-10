@@ -15,7 +15,7 @@ from tqdm import tqdm
 @torch.no_grad()
 def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
                             multi_scale_ppr, config_indices,
-                            split='valid', alpha=0.5, top_k=100,
+                            split='valid', alpha=None, top_k=100,
                             batch_size=65536, device='cpu',
                             K_values=None):
     """
@@ -32,7 +32,7 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         multi_scale_ppr: MultiScalePPR instance
         config_indices: Tensor of config indices (for the evaluated split)
         split: 'valid' or 'test'
-        alpha: PPR combination weight
+        alpha: PPR combination weights (list). See resolve_alpha_weights().
         top_k: Subgraph size
         batch_size: Not used for per-edge eval but kept for API compat
         device: Device
@@ -41,8 +41,14 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
     Returns:
         Dictionary with MRR, AUC, AP, Hits@K
     """
+    from . import resolve_alpha_weights
+
+    if alpha is None:
+        alpha = [0.5]
     if K_values is None:
         K_values = [1, 3, 10, 50, 100]
+
+    w_u, w_v = resolve_alpha_weights(alpha)
 
     encoder.eval()
     predictor.eval()
@@ -62,16 +68,15 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         v_pos = target[idx].item()
         v_negs = target_neg[idx]
 
-        # Determine config for this edge
         if config_indices is not None and idx < len(config_indices):
             cfg_idx = config_indices[idx].item()
         else:
-            cfg_idx = 0  # default to first config
+            cfg_idx = 0
         teleport_u, teleport_v = multi_scale_ppr.get_config_for_index(cfg_idx)
 
         ppr_u = multi_scale_ppr.get_ppr(u, teleport_u)
         ppr_v = multi_scale_ppr.get_ppr(v_pos, teleport_v)
-        combined = alpha * ppr_u + (1 - alpha) * ppr_v
+        combined = w_u * ppr_u + w_v * ppr_v
 
         k_actual = min(top_k, len(combined))
         _, selected_nodes = torch.topk(combined, k_actual)

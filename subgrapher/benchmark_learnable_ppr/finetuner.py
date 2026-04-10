@@ -26,16 +26,23 @@ class LearnablePPRExtractor:
         data: PyG Data object (full graph)
         multi_scale_ppr: MultiScalePPR instance
         config_indices: Tensor [num_edges] of learned config index per edge
-        alpha: Combination weight for PPR_u and PPR_v (fixed)
+        alpha: Combination weights for PPR_u and PPR_v.
+               List of length 1: w_u = alpha[0], w_v = 1 - alpha[0].
+               List of length 2: (w_u, w_v) normalized to sum 1.
+               Scalar accepted for backwards compatibility.
         top_k: Number of nodes to select per subgraph
     """
 
     def __init__(self, data, multi_scale_ppr, config_indices,
-                 alpha=0.5, top_k=100):
+                 alpha=None, top_k=100):
+        from . import resolve_alpha_weights
         self.data = data
         self.multi_scale_ppr = multi_scale_ppr
         self.config_indices = config_indices
+        if alpha is None:
+            alpha = [0.5]
         self.alpha = alpha
+        self.w_u, self.w_v = resolve_alpha_weights(alpha)
         self.top_k = top_k
 
     def extract_subgraph(self, u, v, edge_idx):
@@ -59,7 +66,7 @@ class LearnablePPRExtractor:
         ppr_u = self.multi_scale_ppr.get_ppr(u, teleport_u)
         ppr_v = self.multi_scale_ppr.get_ppr(v, teleport_v)
 
-        combined = self.alpha * ppr_u + (1 - self.alpha) * ppr_v
+        combined = self.w_u * ppr_u + self.w_v * ppr_v
         top_k_actual = min(self.top_k, len(combined))
         _, selected_nodes = torch.topk(combined, top_k_actual)
 
@@ -177,7 +184,7 @@ def train_epoch_finetune(encoder, predictor, data, split_edge,
 
 def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                            multi_scale_ppr, config_indices,
-                           alpha=0.5, top_k=100, epochs=500,
+                           alpha=None, top_k=100, epochs=500,
                            batch_size=8192, lr=0.005, eval_steps=5,
                            device='cpu', verbose=True, patience=30,
                            weight_decay=1e-5, grad_clip=1.0):
@@ -191,7 +198,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         split_edge: Edge split dictionary
         multi_scale_ppr: MultiScalePPR instance
         config_indices: Tensor [num_train_edges] of learned config per edge
-        alpha: PPR combination weight
+        alpha: PPR combination weights (list). See resolve_alpha_weights().
         top_k: Subgraph size
         epochs: Max training epochs
         batch_size: Edges per batch
@@ -206,6 +213,8 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
     Returns:
         history: Training history dict
     """
+    if alpha is None:
+        alpha = [0.5]
     from .evaluator import evaluate_learnable_ppr
 
     encoder = encoder.to(device)

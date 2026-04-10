@@ -145,7 +145,7 @@ def prepare_link_prediction_data(dataset_path, feature_method='random', feature_
         num_neg_samples=edge_splits['test'].size(1) * num_neg_samples_eval
     )
     
-    # Prepare split_edge dictionary (PS2 style)
+    # Prepare split_edge dictionary
     split_edge = {
         'train': {
             'source_node': edge_splits['train'][0],

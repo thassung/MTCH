@@ -102,7 +102,7 @@ class GAT(torch.nn.Module):
 
 class LinkPredictor(torch.nn.Module):
     """
-    MLP-based link predictor following PS2 architecture.
+    MLP-based link predictor.
     Takes element-wise product of node embeddings and passes through MLP.
     """
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout):

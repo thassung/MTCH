@@ -32,5 +32,5 @@ __all__ = [
     'AutoLinkPPR',
     'PPRSearchNet',
     'run_learnable_ppr_benchmark',
-    # 'resolve_alpha_weights',
+    'resolve_alpha_weights',
 ]

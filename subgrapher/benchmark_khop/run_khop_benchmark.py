@@ -32,7 +32,7 @@ DEFAULT_CONFIG = {
     'weight_decay': 1e-5,
     'lr_scheduler': 'reduce_on_plateau',
     'grad_clip': 1.0,
-    'k_values': [2, 3]  # Grid search values (PS2 standard)
+    'k_values': [2, 3]  # Grid search values
 }
 
 

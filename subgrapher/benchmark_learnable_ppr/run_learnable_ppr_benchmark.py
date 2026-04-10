@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     'grad_clip': 1.0,
     # PPR
     'teleport_values': [0.50, 0.85, 0.95],
-    'alpha': 0.5,
+    'alpha': [0.5],
     'top_k': 100,
 }
 
@@ -343,7 +343,8 @@ def main():
                         default=[0.50, 0.85, 0.95],
                         help='Teleport probabilities for PPR search space')
     parser.add_argument('--top_k', type=int, default=100)
-    parser.add_argument('--alpha', type=float, default=0.5)
+    parser.add_argument('--alpha', type=float, nargs='+', default=[0.5],
+                        help='PPR combination weights (1 or 2 values)')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--search_epochs', type=int, default=50)
     parser.add_argument('--search_batch_size', type=int, default=1024)
