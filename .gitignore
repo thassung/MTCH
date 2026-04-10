@@ -10,3 +10,6 @@ tester.*
 *.old
 
 *.md
+
+*.pt
+preprocessed/

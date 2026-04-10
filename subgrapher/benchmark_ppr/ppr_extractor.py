@@ -1,142 +1,126 @@
 """
-Static PPR-based Subgraph Extractor
-
-Implements non-learnable (fixed) PPR-based subgraph extraction for baseline comparison.
-Uses fixed alpha=0.5 and grid search over top-k values.
+Static PPR-based subgraph extractor with preprocessing.
+Precomputes PPR scores once for fast lookup.
 """
 
 import torch
-import networkx as nx
 from torch_geometric.data import Data
-from torch_geometric.utils import to_networkx, subgraph
-from ..utils.ppr_scorer import personalized_pagerank
+from torch_geometric.utils import subgraph
+from ..utils.ppr_preprocessor import PPRPreprocessor
 
 
 class StaticPPRExtractor:
     """
-    Static (non-learnable) PPR-based subgraph extraction.
+    Static PPR-based subgraph extractor with fixed alpha and top-k selection.
     
     Args:
         data: PyG Data object containing the full graph
-        alpha: Fixed combination weight (default 0.5 for balanced)
-        ppr_alpha: PPR damping factor (default 0.85)
-        top_k: Number of top nodes to select (default 100)
-        use_cache: Whether to cache PPR computations (default True)
+        alpha: Fixed weight for combining PPR scores (default: 0.5)
+        top_k: Number of nodes to select based on PPR scores
+        ppr_alpha: Teleport probability for PPR algorithm (default: 0.85)
+        preprocessor: Optional PPRPreprocessor instance (if None, creates new one)
     """
     
-    def __init__(self, data, alpha=0.5, ppr_alpha=0.85, top_k=100, use_cache=True):
+    def __init__(self, data, alpha=0.5, top_k=100, ppr_alpha=0.85, preprocessor=None):
         self.data = data
         self.alpha = alpha
-        self.ppr_alpha = ppr_alpha
         self.top_k = top_k
-        self.use_cache = use_cache
+        self.ppr_alpha = ppr_alpha
         
-        # Convert to NetworkX for PPR computation
-        self.G = to_networkx(data, to_undirected=True)
-        self.nodes = sorted(self.G.nodes())
-        self.num_nodes = len(self.nodes)
+        print(f"StaticPPRExtractor initialized: alpha={alpha}, top_k={top_k}, ppr_alpha={ppr_alpha}")
+        print(f"  Graph: {data.num_nodes} nodes, {data.edge_index.size(1)} edges")
         
-        # PPR cache
-        self.ppr_cache = {} if use_cache else None
-        
-    def compute_ppr(self, seed_node):
-        """Compute PPR scores from a seed node."""
-        if self.ppr_cache is not None and seed_node in self.ppr_cache:
-            return self.ppr_cache[seed_node]
-        
-        # Create personalization vector
-        seeds = {n: 1.0 if n == seed_node else 0.0 for n in self.nodes}
-        
-        # Compute PPR
-        ppr_dict = personalized_pagerank(self.G, seeds, alpha=self.ppr_alpha)
-        
-        # Convert to tensor
-        ppr_tensor = torch.tensor([ppr_dict[n] for n in self.nodes], dtype=torch.float32)
-        
-        # Cache result
-        if self.ppr_cache is not None:
-            self.ppr_cache[seed_node] = ppr_tensor
-            
-        return ppr_tensor
+        # Use provided preprocessor or create new one
+        if preprocessor is not None:
+            print(f"  Using provided preprocessor")
+            self.preprocessor = preprocessor
+        else:
+            print(f"  Creating new preprocessor...")
+            self.preprocessor = PPRPreprocessor(data, ppr_alpha=ppr_alpha)
     
     def extract_subgraph(self, u, v):
         """
-        Extract subgraph around nodes u and v using static PPR.
+        Extract subgraph around edge (u, v) using PPR-based selection.
+        Uses precomputed PPR scores for fast lookup.
         
         Args:
             u: Source node index
             v: Target node index
-            
-        Returns:
-            subgraph_data: PyG Data object for the subgraph
-            selected_nodes: Tensor of selected node indices
-            metadata: Dict with extraction statistics
-        """
-        # Compute PPR from both nodes
-        ppr_u = self.compute_ppr(u)
-        ppr_v = self.compute_ppr(v)
         
-        # Combine with fixed alpha
+        Returns:
+            subgraph_data: PyG Data object with remapped indices
+            selected_nodes: Original node indices selected for subgraph
+            metadata: Dictionary with extraction metadata
+        """
+        # Get precomputed PPR scores (fast!)
+        ppr_u = self.preprocessor.get_ppr(u)
+        ppr_v = self.preprocessor.get_ppr(v)
+        
+        # Combine PPR scores (fixed alpha)
         combined_scores = self.alpha * ppr_u + (1 - self.alpha) * ppr_v
         
         # Select top-k nodes
-        top_k_actual = min(self.top_k, self.num_nodes)
-        top_k_values, top_k_indices = torch.topk(combined_scores, top_k_actual)
+        top_k_actual = min(self.top_k, len(combined_scores))
+        _, top_indices = torch.topk(combined_scores, top_k_actual)
+        selected_nodes = top_indices
         
-        # Ensure u and v are included
-        selected_nodes = top_k_indices
+        # Always include u and v
         if u not in selected_nodes:
             selected_nodes = torch.cat([selected_nodes, torch.tensor([u])])
         if v not in selected_nodes:
             selected_nodes = torch.cat([selected_nodes, torch.tensor([v])])
         
-        # Remove duplicates and sort
-        selected_nodes = torch.unique(selected_nodes)
-        
-        # Extract subgraph
-        edge_index, edge_attr = subgraph(
+        # Extract subgraph using PyG utils
+        edge_index_sub, edge_attr_sub = subgraph(
             selected_nodes,
             self.data.edge_index,
-            edge_attr=self.data.edge_attr if hasattr(self.data, 'edge_attr') else None,
+            edge_attr=self.data.edge_attr if hasattr(self.data, 'edge_attr') and self.data.edge_attr is not None else None,
             relabel_nodes=True,
-            num_nodes=self.num_nodes
+            num_nodes=self.data.num_nodes
         )
         
-        # Create new mapping for u and v
+        # Create node mapping (old_idx -> new_idx)
         node_mapping = {old_idx.item(): new_idx for new_idx, old_idx in enumerate(selected_nodes)}
-        u_new = node_mapping.get(u, -1)
-        v_new = node_mapping.get(v, -1)
         
-        # Create subgraph data object
+        # Get remapped indices for u and v
+        u_sub = node_mapping.get(u, -1)
+        v_sub = node_mapping.get(v, -1)
+        
+        # Extract node features for selected nodes
+        x_sub = self.data.x[selected_nodes]
+        
+        # Create subgraph Data object
         subgraph_data = Data(
-            x=self.data.x[selected_nodes] if hasattr(self.data, 'x') else None,
-            edge_index=edge_index,
-            edge_attr=edge_attr,
+            x=x_sub,
+            edge_index=edge_index_sub,
+            edge_attr=edge_attr_sub,
             num_nodes=len(selected_nodes)
         )
         
         # Metadata
         metadata = {
-            'num_selected': len(selected_nodes),
-            'alpha': self.alpha,
-            'top_k': self.top_k,
             'u_original': u,
             'v_original': v,
-            'u_subgraph': u_new,
-            'v_subgraph': v_new,
-            'avg_ppr_score': combined_scores[selected_nodes].mean().item(),
-            'min_ppr_score': combined_scores[selected_nodes].min().item(),
-            'max_ppr_score': combined_scores[selected_nodes].max().item()
+            'u_subgraph': u_sub,
+            'v_subgraph': v_sub,
+            'num_nodes_selected': len(selected_nodes),
+            'num_edges_subgraph': edge_index_sub.size(1),
+            'alpha': self.alpha,
+            'top_k': self.top_k,
+            'ppr_score_u': combined_scores[u].item(),
+            'ppr_score_v': combined_scores[v].item()
         }
         
         return subgraph_data, selected_nodes, metadata
     
-    def clear_cache(self):
-        """Clear PPR cache to free memory."""
-        if self.ppr_cache is not None:
-            self.ppr_cache.clear()
+    def get_cache_stats(self):
+        """Get PPR cache statistics."""
+        stats = self.preprocessor.get_stats()
+        return {
+            'cache_size': stats['num_cached'],
+            'cache_memory_mb': stats['memory_mb']
+        }
     
-    def get_cache_size(self):
-        """Get number of cached PPR computations."""
-        return len(self.ppr_cache) if self.ppr_cache is not None else 0
-
+    def __repr__(self):
+        return (f"StaticPPRExtractor(alpha={self.alpha}, top_k={self.top_k}, "
+                f"preprocessor={self.preprocessor})")
