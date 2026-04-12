@@ -1,12 +1,13 @@
---extra-index-url https://download.pytorch.org/whl/cu129
---find-links https://data.pyg.org/whl/torch-2.8.0+cu129.html
+# Main Torch Installation (Run with --index-url https://download.pytorch.org/whl/cu121)
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
 
-torch>=2.0,<3
-pyg-lib>=0.2.0
-torch-scatter>=2.0.9
-torch-sparse>=0.6.12
-torch-geometric>=2.0.0
+# PyG Specific Binaries (Install via -f https://data.pyg.org/whl/torch-2.4.1+cu121.html)
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+torch-geometric==2.6.1
 
+# General Dependencies
 matplotlib>=3.5
 networkx>=2.6
 scikit-learn>=1.0
