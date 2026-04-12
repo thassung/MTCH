@@ -70,17 +70,15 @@ class LearnablePPRExtractor:
         top_k_actual = min(self.top_k, len(combined))
         _, selected_nodes = torch.topk(combined, top_k_actual)
 
-        edge_dev = self.data.edge_index.device
-        selected_nodes = selected_nodes.to(edge_dev)
+        dev = self.data.edge_index.device
+        selected_nodes = selected_nodes.detach().to(dev).long()
 
-        if u not in selected_nodes:
-            selected_nodes = torch.cat([
-                selected_nodes,
-                torch.tensor([u], device=edge_dev, dtype=selected_nodes.dtype)])
-        if v not in selected_nodes:
-            selected_nodes = torch.cat([
-                selected_nodes,
-                torch.tensor([v], device=edge_dev, dtype=selected_nodes.dtype)])
+        if not (selected_nodes == u).any():
+            selected_nodes = torch.cat(
+                [selected_nodes, torch.tensor([u], device=dev, dtype=torch.long)])
+        if not (selected_nodes == v).any():
+            selected_nodes = torch.cat(
+                [selected_nodes, torch.tensor([v], device=dev, dtype=torch.long)])
 
         edge_index_sub, _ = subgraph(
             selected_nodes, self.data.edge_index,
@@ -107,12 +105,45 @@ class LearnablePPRExtractor:
         return subgraph_data, selected_nodes, metadata
 
 
+def _forward_micro_batch(encoder, predictor, subgraph_list, edge_mappings, device):
+    """Run forward + loss on a micro-batch of subgraphs. Returns (loss, n_examples)."""
+    batched = Batch.from_data_list(subgraph_list).to(device)
+    h = encoder(batched.x, batched.edge_index)
+
+    mb_loss = torch.tensor(0.0, device=device)
+    mb_examples = 0
+    node_offset = 0
+
+    for u_sub, v_sub, num_nodes in edge_mappings:
+        u_idx = node_offset + u_sub
+        v_idx = node_offset + v_sub
+
+        pos_out = predictor(h[u_idx].unsqueeze(0), h[v_idx].unsqueeze(0))
+        pos_loss = -torch.log(pos_out + 1e-15).mean()
+
+        neg_offset = torch.randint(0, num_nodes, (1,), device=device)
+        neg_idx = node_offset + neg_offset
+        neg_out = predictor(h[u_idx].unsqueeze(0), h[neg_idx])
+        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
+
+        mb_loss = mb_loss + pos_loss + neg_loss
+        mb_examples += 1
+        node_offset += num_nodes
+
+    return mb_loss, mb_examples
+
+
 def train_epoch_finetune(encoder, predictor, data, split_edge,
                          extractor, optimizer, batch_size, device,
-                         grad_clip=None, verbose=False):
+                         grad_clip=None, verbose=False,
+                         max_subgraphs_per_forward=256):
     """
     Train one epoch on subgraphs extracted with learned PPR configs.
-    Same batched disjoint-union approach as benchmark_ppr/trainer_batched.py.
+
+    Subgraphs are extracted on CPU, then forwarded in micro-batches of
+    *max_subgraphs_per_forward* to avoid GPU OOM.  Gradients are
+    accumulated across micro-batches before a single optimizer step per
+    outer batch.
     """
     encoder.train()
     predictor.train()
@@ -120,7 +151,7 @@ def train_epoch_finetune(encoder, predictor, data, split_edge,
     source = split_edge['train']['source_node']
     target = split_edge['train']['target_node']
 
-    total_loss = 0
+    total_loss = 0.0
     total_examples = 0
 
     dataloader = DataLoader(range(source.size(0)), batch_size, shuffle=True)
@@ -128,63 +159,60 @@ def train_epoch_finetune(encoder, predictor, data, split_edge,
         dataloader = tqdm(dataloader, desc='  Fine-tune batches', leave=False)
 
     for perm in dataloader:
-        optimizer.zero_grad()
-
+        # --- extract all subgraphs for this batch (CPU-side) ---
         subgraph_list = []
         edge_mappings = []
 
-        for idx, i in enumerate(perm):
+        for i in perm:
             u = source[i].item()
             v = target[i].item()
-
-            sub_data, selected, meta = extractor.extract_subgraph(
-                u, v, i.item())
-            u_sub = meta['u_subgraph']
-            v_sub = meta['v_subgraph']
-
-            if u_sub == -1 or v_sub == -1:
+            sub_data, _, meta = extractor.extract_subgraph(u, v, i.item())
+            if meta['u_subgraph'] == -1 or meta['v_subgraph'] == -1:
                 continue
-
             subgraph_list.append(sub_data)
-            edge_mappings.append((u_sub, v_sub, meta['num_nodes_selected']))
+            edge_mappings.append((meta['u_subgraph'], meta['v_subgraph'],
+                                  meta['num_nodes_selected']))
 
         if len(subgraph_list) == 0:
             continue
 
-        batched = Batch.from_data_list(subgraph_list).to(device)
-        h = encoder(batched.x, batched.edge_index)
+        # --- micro-batch forward with gradient accumulation ---
+        optimizer.zero_grad()
+        accum_loss = 0.0
+        accum_examples = 0
+        n = len(subgraph_list)
+        mb = max_subgraphs_per_forward
 
-        batch_loss = 0
-        batch_examples = 0
-        node_offset = 0
+        for start in range(0, n, mb):
+            end = min(start + mb, n)
+            mb_loss, mb_ex = _forward_micro_batch(
+                encoder, predictor,
+                subgraph_list[start:end], edge_mappings[start:end], device)
+            if mb_ex == 0:
+                continue
+            (mb_loss / mb_ex).backward()
+            accum_loss += mb_loss.item()
+            accum_examples += mb_ex
 
-        for idx, (u_sub, v_sub, num_nodes) in enumerate(edge_mappings):
-            u_idx = node_offset + u_sub
-            v_idx = node_offset + v_sub
+        if accum_examples > 0:
+            # Scale gradients so the effective loss = mean over all micro-batches
+            n_micro = (n + mb - 1) // mb
+            if n_micro > 1:
+                scale = 1.0 / n_micro
+                for p in list(encoder.parameters()) + list(predictor.parameters()):
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
 
-            pos_out = predictor(h[u_idx].unsqueeze(0),
-                                h[v_idx].unsqueeze(0))
-            pos_loss = -torch.log(pos_out + 1e-15).mean()
-
-            neg_offset = torch.randint(0, num_nodes, (1,), device=device)
-            neg_idx = node_offset + neg_offset
-            neg_out = predictor(h[u_idx].unsqueeze(0), h[neg_idx])
-            neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
-
-            batch_loss += pos_loss + neg_loss
-            batch_examples += 1
-            node_offset += num_nodes
-
-        if batch_examples > 0:
-            batch_loss = batch_loss / batch_examples
-            batch_loss.backward()
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(
                     list(encoder.parameters()) +
                     list(predictor.parameters()), grad_clip)
             optimizer.step()
-            total_loss += batch_loss.item() * batch_examples
-            total_examples += batch_examples
+            total_loss += accum_loss / accum_examples * accum_examples
+            total_examples += accum_examples
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return total_loss / max(total_examples, 1)
 
@@ -194,7 +222,9 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                            alpha=None, top_k=100, epochs=500,
                            batch_size=8192, lr=0.005, eval_steps=5,
                            device='cpu', verbose=True, patience=30,
-                           weight_decay=1e-5, grad_clip=1.0):
+                           weight_decay=1e-5, grad_clip=1.0,
+                           max_subgraphs_per_forward=256,
+                           checkpoint_dir=None):
     """
     Phase 2: Fine-tune encoder+predictor on subgraphs with learned configs.
 
@@ -208,7 +238,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         alpha: PPR combination weights (list). See resolve_alpha_weights().
         top_k: Subgraph size
         epochs: Max training epochs
-        batch_size: Edges per batch
+        batch_size: Edges per batch (subgraph extraction batch)
         lr: Learning rate
         eval_steps: Evaluate every N epochs
         device: Device
@@ -216,10 +246,15 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         patience: Early stopping patience
         weight_decay: L2 regularization
         grad_clip: Gradient clipping norm
+        max_subgraphs_per_forward: GPU micro-batch size (subgraphs per
+            forward pass). Lower this if OOM occurs.
+        checkpoint_dir: If set, saves best model + periodic checkpoints
+            to this directory so progress survives crashes.
 
     Returns:
         history: Training history dict
     """
+    import os as _os
     if alpha is None:
         alpha = [0.5]
     from .evaluator import evaluate_learnable_ppr
@@ -246,19 +281,44 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         'stopped_early': False,
     }
 
+    # --- resume from checkpoint if available ---
+    start_epoch = 1
     best_val_mrr = 0.0
     epochs_no_improve = 0
     best_state = None
+
+    if checkpoint_dir:
+        _os.makedirs(checkpoint_dir, exist_ok=True)
+        ckpt_path = _os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        if _os.path.isfile(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            encoder.load_state_dict(ckpt['encoder'])
+            predictor.load_state_dict(ckpt['predictor'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+            scheduler.load_state_dict(ckpt['scheduler'])
+            history = ckpt['history']
+            start_epoch = ckpt['epoch'] + 1
+            best_val_mrr = ckpt['best_val_mrr']
+            epochs_no_improve = ckpt.get('epochs_no_improve', 0)
+            best_state = ckpt.get('best_state', None)
+            if verbose:
+                print(f"[Checkpoint] Resumed from epoch {ckpt['epoch']} "
+                      f"(best MRR {best_val_mrr:.4f})")
+
     start = time.time()
 
-    iterator = tqdm(range(1, epochs + 1), desc='Fine-tuning') if verbose else range(1, epochs + 1)
+    iterator = range(start_epoch, epochs + 1)
+    if verbose:
+        iterator = tqdm(iterator, desc='Fine-tuning',
+                        initial=start_epoch - 1, total=epochs)
 
     for epoch in iterator:
-        show_batch = (epoch <= 3) if verbose else False
+        show_batch = (epoch <= start_epoch + 2) if verbose else False
         loss = train_epoch_finetune(
             encoder, predictor, data, split_edge, extractor,
             optimizer, batch_size, device, grad_clip=grad_clip,
-            verbose=show_batch)
+            verbose=show_batch,
+            max_subgraphs_per_forward=max_subgraphs_per_forward)
         history['train_loss'].append(loss)
 
         if epoch % eval_steps == 0 or epoch == epochs:
@@ -281,6 +341,9 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                     'encoder': copy.deepcopy(encoder.state_dict()),
                     'predictor': copy.deepcopy(predictor.state_dict()),
                 }
+                if checkpoint_dir:
+                    torch.save(best_state,
+                               _os.path.join(checkpoint_dir, 'best_model.pt'))
             else:
                 epochs_no_improve += eval_steps
 
@@ -292,13 +355,27 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                     'pat': f'{epochs_no_improve}/{patience}',
                 })
 
+            # periodic checkpoint every eval_steps
+            if checkpoint_dir:
+                torch.save({
+                    'epoch': epoch,
+                    'encoder': encoder.state_dict(),
+                    'predictor': predictor.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'history': history,
+                    'best_val_mrr': best_val_mrr,
+                    'epochs_no_improve': epochs_no_improve,
+                    'best_state': best_state,
+                }, _os.path.join(checkpoint_dir, 'latest_checkpoint.pt'))
+
             if epochs_no_improve >= patience:
                 history['stopped_early'] = True
                 if verbose:
                     print(f"\n[Early Stop] epoch {epoch}")
                 break
 
-    history['total_time'] = time.time() - start
+    history['total_time'] = history.get('total_time', 0) + (time.time() - start)
 
     if best_state:
         encoder.load_state_dict(best_state['encoder'])
