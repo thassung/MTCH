@@ -3,10 +3,16 @@ Phase 2: Fine-tune a GNN on subgraphs extracted with learned PPR configurations.
 
 Uses the per-edge (teleport_u, teleport_v) configs from architecture search
 to extract actual subgraphs, then trains with the existing batched infrastructure.
+
+Optimizations over naive per-edge-per-epoch extraction:
+  - SubgraphCache: extract every subgraph once, reuse across all epochs
+  - Vectorized loss: single batched predictor call instead of Python for-loop
+  - Edge subsampling: use a random subset of training edges per epoch
 """
 
 import torch
 import torch.nn as nn
+import os
 import time
 import copy
 from torch.utils.data import DataLoader
@@ -48,11 +54,6 @@ class LearnablePPRExtractor:
     def extract_subgraph(self, u, v, edge_idx):
         """
         Extract subgraph for edge (u,v) using its learned PPR config.
-
-        Args:
-            u: Source node index
-            v: Target node index
-            edge_idx: Index into config_indices for this edge
 
         Returns:
             subgraph_data: PyG Data with remapped indices
@@ -105,78 +106,232 @@ class LearnablePPRExtractor:
         return subgraph_data, selected_nodes, metadata
 
 
-def _forward_micro_batch(encoder, predictor, subgraph_list, edge_mappings, device):
-    """Run forward + loss on a micro-batch of subgraphs. Returns (loss, n_examples)."""
+# ---------------------------------------------------------------------------
+# SubgraphCache: pre-extract once, reuse every epoch
+# ---------------------------------------------------------------------------
+
+class SubgraphCache:
+    """Pre-extracted subgraph topology for every edge in a split.
+
+    Stores only the topology (selected_nodes, edge_index_sub, u_sub, v_sub)
+    so the cache is compact (~2-6 GB for ~400K edges).  Node features are
+    sliced from ``data.x`` at training time.
+
+    Usage::
+
+        cache = SubgraphCache.build(extractor, split_edge, 'train', verbose=True)
+        cache.save('cache/train.pt')
+        cache = SubgraphCache.load('cache/train.pt')
+    """
+
+    def __init__(self, selected_nodes_list, edge_index_list,
+                 u_sub_list, v_sub_list, num_nodes_list):
+        self.selected_nodes = selected_nodes_list   # list[Tensor]
+        self.edge_index = edge_index_list            # list[Tensor [2, E_i]]
+        self.u_sub = u_sub_list                      # list[int]
+        self.v_sub = v_sub_list                      # list[int]
+        self.num_nodes = num_nodes_list              # list[int]
+
+    def __len__(self):
+        return len(self.selected_nodes)
+
+    # ---- factory ----------------------------------------------------------
+
+    @classmethod
+    def build_fast(cls, extractor, split_edge, split='train', verbose=True):
+        """Extract subgraphs storing topology compactly (CPU tensors)."""
+        source = split_edge[split]['source_node']
+        target = split_edge[split]['target_node']
+        n = source.size(0)
+
+        sel_list, ei_list, u_list, v_list, nn_list = [], [], [], [], []
+        skipped = 0
+
+        edge_index_cpu = extractor.data.edge_index.cpu()
+        num_graph_nodes = extractor.data.num_nodes
+
+        it = tqdm(range(n), desc=f'Caching {split} subgraphs') if verbose else range(n)
+        for i in it:
+            u = source[i].item()
+            v = target[i].item()
+
+            config_idx = extractor.config_indices[i].item()
+            teleport_u, teleport_v = extractor.multi_scale_ppr.get_config_for_index(config_idx)
+
+            ppr_u = extractor.multi_scale_ppr.get_ppr(u, teleport_u)
+            ppr_v = extractor.multi_scale_ppr.get_ppr(v, teleport_v)
+
+            combined = extractor.w_u * ppr_u + extractor.w_v * ppr_v
+            top_k_actual = min(extractor.top_k, len(combined))
+            _, selected_nodes = torch.topk(combined, top_k_actual)
+            selected_nodes = selected_nodes.cpu().long()
+
+            if not (selected_nodes == u).any():
+                selected_nodes = torch.cat(
+                    [selected_nodes, torch.tensor([u], dtype=torch.long)])
+            if not (selected_nodes == v).any():
+                selected_nodes = torch.cat(
+                    [selected_nodes, torch.tensor([v], dtype=torch.long)])
+
+            edge_index_sub, _ = subgraph(
+                selected_nodes, edge_index_cpu,
+                relabel_nodes=True, num_nodes=num_graph_nodes)
+
+            node_mapping = {node.item(): new_idx
+                            for new_idx, node in enumerate(selected_nodes)}
+            u_sub = node_mapping.get(u, -1)
+            v_sub = node_mapping.get(v, -1)
+
+            if u_sub == -1 or v_sub == -1:
+                sel_list.append(torch.zeros(0, dtype=torch.long))
+                ei_list.append(torch.zeros(2, 0, dtype=torch.long))
+                u_list.append(-1)
+                v_list.append(-1)
+                nn_list.append(0)
+                skipped += 1
+            else:
+                sel_list.append(selected_nodes)
+                ei_list.append(edge_index_sub)
+                u_list.append(u_sub)
+                v_list.append(v_sub)
+                nn_list.append(len(selected_nodes))
+
+        if verbose and skipped:
+            print(f'  ({skipped}/{n} edges skipped: u or v not in subgraph)')
+
+        return cls(sel_list, ei_list, u_list, v_list, nn_list)
+
+    # ---- persistence ------------------------------------------------------
+
+    def save(self, path):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        torch.save({
+            'selected_nodes': self.selected_nodes,
+            'edge_index': self.edge_index,
+            'u_sub': self.u_sub,
+            'v_sub': self.v_sub,
+            'num_nodes': self.num_nodes,
+        }, path)
+
+    @classmethod
+    def load(cls, path):
+        d = torch.load(path, map_location='cpu')
+        return cls(d['selected_nodes'], d['edge_index'],
+                   d['u_sub'], d['v_sub'], d['num_nodes'])
+
+    # ---- helpers ----------------------------------------------------------
+
+    def make_data(self, idx, x_full):
+        """Build a PyG Data for edge *idx*, slicing features from *x_full*."""
+        sel = self.selected_nodes[idx]
+        if len(sel) == 0:
+            return None, -1, -1
+        x_sub = x_full[sel.to(x_full.device)]
+        return (Data(x=x_sub, edge_index=self.edge_index[idx],
+                     num_nodes=self.num_nodes[idx]),
+                self.u_sub[idx], self.v_sub[idx])
+
+
+def build_or_load_cache(extractor, split_edge, split, cache_dir,
+                        verbose=True):
+    """Build a SubgraphCache or load from disk if it already exists."""
+    if cache_dir:
+        path = os.path.join(cache_dir, f'{split}_subgraphs.pt')
+        if os.path.isfile(path):
+            if verbose:
+                print(f'[Cache] Loading {split} subgraphs from {path}')
+            return SubgraphCache.load(path)
+
+    if verbose:
+        print(f'[Cache] Extracting {split} subgraphs (one-time cost)...')
+    cache = SubgraphCache.build_fast(extractor, split_edge, split, verbose)
+
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f'{split}_subgraphs.pt')
+        cache.save(path)
+        mb = os.path.getsize(path) / 1e6
+        if verbose:
+            print(f'[Cache] Saved {split} cache: {path} ({mb:.0f} MB)')
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Vectorized forward + loss
+# ---------------------------------------------------------------------------
+
+def _forward_micro_batch(encoder, predictor, subgraph_list, u_subs, v_subs,
+                         num_nodes_list, device):
+    """Vectorized forward + loss on a micro-batch of subgraphs."""
     batched = Batch.from_data_list(subgraph_list).to(device)
     h = encoder(batched.x, batched.edge_index)
 
-    mb_loss = torch.tensor(0.0, device=device)
-    mb_examples = 0
-    node_offset = 0
+    B = len(u_subs)
+    offsets = torch.zeros(B, dtype=torch.long, device=device)
+    nn_t = torch.tensor(num_nodes_list, dtype=torch.long, device=device)
+    if B > 1:
+        offsets[1:] = nn_t[:-1].cumsum(0)
 
-    for u_sub, v_sub, num_nodes in edge_mappings:
-        u_idx = node_offset + u_sub
-        v_idx = node_offset + v_sub
+    u_indices = offsets + torch.tensor(u_subs, dtype=torch.long, device=device)
+    v_indices = offsets + torch.tensor(v_subs, dtype=torch.long, device=device)
+    neg_local = torch.stack([
+        torch.randint(0, nn, (1,)) for nn in num_nodes_list
+    ]).squeeze(1).to(device)
+    neg_indices = offsets + neg_local
 
-        pos_out = predictor(h[u_idx].unsqueeze(0), h[v_idx].unsqueeze(0))
-        pos_loss = -torch.log(pos_out + 1e-15).mean()
+    pos_out = predictor(h[u_indices], h[v_indices])
+    neg_out = predictor(h[u_indices], h[neg_indices])
 
-        neg_offset = torch.randint(0, num_nodes, (1,), device=device)
-        neg_idx = node_offset + neg_offset
-        neg_out = predictor(h[u_idx].unsqueeze(0), h[neg_idx])
-        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
-
-        mb_loss = mb_loss + pos_loss + neg_loss
-        mb_examples += 1
-        node_offset += num_nodes
-
-    return mb_loss, mb_examples
+    loss = (-torch.log(pos_out + 1e-15) - torch.log(1 - neg_out + 1e-15)).mean()
+    return loss, B
 
 
-def train_epoch_finetune(encoder, predictor, data, split_edge,
-                         extractor, optimizer, batch_size, device,
-                         grad_clip=None, verbose=False,
-                         max_subgraphs_per_forward=256):
-    """
-    Train one epoch on subgraphs extracted with learned PPR configs.
+# ---------------------------------------------------------------------------
+# Training loop (uses cache + subsampling)
+# ---------------------------------------------------------------------------
 
-    Subgraphs are extracted on CPU, then forwarded in micro-batches of
-    *max_subgraphs_per_forward* to avoid GPU OOM.  Gradients are
-    accumulated across micro-batches before a single optimizer step per
-    outer batch.
+def train_epoch_finetune(encoder, predictor, data, cache, optimizer,
+                         batch_size, device, grad_clip=None, verbose=False,
+                         max_subgraphs_per_forward=256,
+                         edges_per_epoch=None):
+    """Train one epoch using pre-cached subgraphs.
+
+    Args:
+        cache: SubgraphCache for the training split.
+        edges_per_epoch: If set, subsample this many edges per epoch.
     """
     encoder.train()
     predictor.train()
 
-    source = split_edge['train']['source_node']
-    target = split_edge['train']['target_node']
+    n_total = len(cache)
+    if edges_per_epoch and edges_per_epoch < n_total:
+        indices = torch.randperm(n_total)[:edges_per_epoch]
+    else:
+        indices = torch.randperm(n_total)
 
     total_loss = 0.0
     total_examples = 0
 
-    dataloader = DataLoader(range(source.size(0)), batch_size, shuffle=True)
+    dataloader = DataLoader(indices.tolist(), batch_size, shuffle=False)
     if verbose:
         dataloader = tqdm(dataloader, desc='  Fine-tune batches', leave=False)
 
-    for perm in dataloader:
-        # --- extract all subgraphs for this batch (CPU-side) ---
-        subgraph_list = []
-        edge_mappings = []
+    x_full = data.x
 
-        for i in perm:
-            u = source[i].item()
-            v = target[i].item()
-            sub_data, _, meta = extractor.extract_subgraph(u, v, i.item())
-            if meta['u_subgraph'] == -1 or meta['v_subgraph'] == -1:
+    for perm in dataloader:
+        subgraph_list, u_subs, v_subs, nn_list = [], [], [], []
+        for idx in perm:
+            sub_data, u_s, v_s = cache.make_data(idx, x_full)
+            if sub_data is None:
                 continue
             subgraph_list.append(sub_data)
-            edge_mappings.append((meta['u_subgraph'], meta['v_subgraph'],
-                                  meta['num_nodes_selected']))
+            u_subs.append(u_s)
+            v_subs.append(v_s)
+            nn_list.append(cache.num_nodes[idx])
 
         if len(subgraph_list) == 0:
             continue
 
-        # --- micro-batch forward with gradient accumulation ---
         optimizer.zero_grad()
         accum_loss = 0.0
         accum_examples = 0
@@ -187,15 +342,14 @@ def train_epoch_finetune(encoder, predictor, data, split_edge,
             end = min(start + mb, n)
             mb_loss, mb_ex = _forward_micro_batch(
                 encoder, predictor,
-                subgraph_list[start:end], edge_mappings[start:end], device)
-            if mb_ex == 0:
-                continue
-            (mb_loss / mb_ex).backward()
-            accum_loss += mb_loss.item()
+                subgraph_list[start:end],
+                u_subs[start:end], v_subs[start:end],
+                nn_list[start:end], device)
+            mb_loss.backward()
+            accum_loss += mb_loss.item() * mb_ex
             accum_examples += mb_ex
 
         if accum_examples > 0:
-            # Scale gradients so the effective loss = mean over all micro-batches
             n_micro = (n + mb - 1) // mb
             if n_micro > 1:
                 scale = 1.0 / n_micro
@@ -208,7 +362,7 @@ def train_epoch_finetune(encoder, predictor, data, split_edge,
                     list(encoder.parameters()) +
                     list(predictor.parameters()), grad_clip)
             optimizer.step()
-            total_loss += accum_loss / accum_examples * accum_examples
+            total_loss += accum_loss
             total_examples += accum_examples
 
         if torch.cuda.is_available():
@@ -217,14 +371,20 @@ def train_epoch_finetune(encoder, predictor, data, split_edge,
     return total_loss / max(total_examples, 1)
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                            multi_scale_ppr, config_indices,
-                           alpha=None, top_k=100, epochs=500,
+                           alpha=None, top_k=100, epochs=200,
                            batch_size=8192, lr=0.005, eval_steps=5,
-                           device='cpu', verbose=True, patience=30,
+                           device='cpu', verbose=True, patience=20,
                            weight_decay=1e-5, grad_clip=1.0,
                            max_subgraphs_per_forward=256,
-                           checkpoint_dir=None):
+                           checkpoint_dir=None,
+                           cache_dir=None,
+                           edges_per_epoch=None):
     """
     Phase 2: Fine-tune encoder+predictor on subgraphs with learned configs.
 
@@ -238,7 +398,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         alpha: PPR combination weights (list). See resolve_alpha_weights().
         top_k: Subgraph size
         epochs: Max training epochs
-        batch_size: Edges per batch (subgraph extraction batch)
+        batch_size: Edges per batch
         lr: Learning rate
         eval_steps: Evaluate every N epochs
         device: Device
@@ -248,13 +408,15 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         grad_clip: Gradient clipping norm
         max_subgraphs_per_forward: GPU micro-batch size (subgraphs per
             forward pass). Lower this if OOM occurs.
-        checkpoint_dir: If set, saves best model + periodic checkpoints
-            to this directory so progress survives crashes.
+        checkpoint_dir: Saves best model + periodic checkpoints here.
+        cache_dir: Directory for pre-extracted subgraph caches.
+            If None, caches are built in memory only (not persisted).
+        edges_per_epoch: If set, subsample this many training edges per
+            epoch instead of using all.  Greatly reduces epoch time.
 
     Returns:
         history: Training history dict
     """
-    import os as _os
     if alpha is None:
         alpha = [0.5]
     from .evaluator import evaluate_learnable_ppr
@@ -262,10 +424,15 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
     encoder = encoder.to(device)
     predictor = predictor.to(device)
 
+    # ---- build / load subgraph caches ------------------------------------
     extractor = LearnablePPRExtractor(
         data, multi_scale_ppr, config_indices,
         alpha=alpha, top_k=top_k)
 
+    train_cache = build_or_load_cache(
+        extractor, split_edge, 'train', cache_dir, verbose)
+
+    # ---- optimizer / scheduler -------------------------------------------
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(predictor.parameters()),
         lr=lr, weight_decay=weight_decay)
@@ -281,16 +448,16 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         'stopped_early': False,
     }
 
-    # --- resume from checkpoint if available ---
     start_epoch = 1
     best_val_mrr = 0.0
     epochs_no_improve = 0
     best_state = None
 
+    # ---- resume from checkpoint ------------------------------------------
     if checkpoint_dir:
-        _os.makedirs(checkpoint_dir, exist_ok=True)
-        ckpt_path = _os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
-        if _os.path.isfile(ckpt_path):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        ckpt_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        if os.path.isfile(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=device)
             encoder.load_state_dict(ckpt['encoder'])
             predictor.load_state_dict(ckpt['predictor'])
@@ -315,10 +482,11 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
     for epoch in iterator:
         show_batch = (epoch <= start_epoch + 2) if verbose else False
         loss = train_epoch_finetune(
-            encoder, predictor, data, split_edge, extractor,
+            encoder, predictor, data, train_cache,
             optimizer, batch_size, device, grad_clip=grad_clip,
             verbose=show_batch,
-            max_subgraphs_per_forward=max_subgraphs_per_forward)
+            max_subgraphs_per_forward=max_subgraphs_per_forward,
+            edges_per_epoch=edges_per_epoch)
         history['train_loss'].append(loss)
 
         if epoch % eval_steps == 0 or epoch == epochs:
@@ -326,7 +494,8 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                 encoder, predictor, data, split_edge,
                 multi_scale_ppr, config_indices,
                 split='valid', alpha=alpha, top_k=top_k,
-                batch_size=batch_size, device=device)
+                batch_size=batch_size, device=device,
+                cache_dir=cache_dir)
             history['val_results'].append(val_results)
 
             mrr = val_results['mrr']
@@ -343,7 +512,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                 }
                 if checkpoint_dir:
                     torch.save(best_state,
-                               _os.path.join(checkpoint_dir, 'best_model.pt'))
+                               os.path.join(checkpoint_dir, 'best_model.pt'))
             else:
                 epochs_no_improve += eval_steps
 
@@ -355,7 +524,6 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                     'pat': f'{epochs_no_improve}/{patience}',
                 })
 
-            # periodic checkpoint every eval_steps
             if checkpoint_dir:
                 torch.save({
                     'epoch': epoch,
@@ -367,7 +535,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                     'best_val_mrr': best_val_mrr,
                     'epochs_no_improve': epochs_no_improve,
                     'best_state': best_state,
-                }, _os.path.join(checkpoint_dir, 'latest_checkpoint.pt'))
+                }, os.path.join(checkpoint_dir, 'latest_checkpoint.pt'))
 
             if epochs_no_improve >= patience:
                 history['stopped_early'] = True

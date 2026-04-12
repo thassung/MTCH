@@ -1,6 +1,8 @@
 """
 Evaluation for learnable PPR subgraph link prediction.
 Uses per-edge learned configurations for subgraph extraction during eval.
+
+Supports optional SubgraphCache for fast repeated evaluation.
 """
 
 import torch
@@ -17,12 +19,13 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
                             multi_scale_ppr, config_indices,
                             split='valid', alpha=None, top_k=100,
                             batch_size=65536, device='cpu',
-                            K_values=None):
+                            K_values=None,
+                            cache_dir=None):
     """
     Evaluate link prediction with learned per-edge PPR configurations.
 
-    For each edge, extracts a subgraph using the learned (teleport_u, teleport_v)
-    config, encodes it, and computes prediction scores.
+    If *cache_dir* is provided the function loads (or builds + saves)
+    a SubgraphCache so repeated evaluations are fast.
 
     Args:
         encoder: GNN encoder
@@ -37,11 +40,14 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         batch_size: Not used for per-edge eval but kept for API compat
         device: Device
         K_values: Hit@K values to compute
+        cache_dir: If set, loads/builds SubgraphCache on disk for this split.
 
     Returns:
         Dictionary with MRR, AUC, AP, Hits@K
     """
     from . import resolve_alpha_weights
+    from .finetuner import (LearnablePPRExtractor, SubgraphCache,
+                            build_or_load_cache)
 
     if alpha is None:
         alpha = [0.5]
@@ -60,6 +66,15 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
     num_pos = source.size(0)
     num_neg_per_pos = target_neg.size(1)
 
+    # ---- optionally use cache --------------------------------------------
+    cache = None
+    if cache_dir is not None:
+        extractor = LearnablePPRExtractor(
+            data, multi_scale_ppr, config_indices,
+            alpha=alpha, top_k=top_k)
+        cache = build_or_load_cache(
+            extractor, split_edge, split, cache_dir, verbose=False)
+
     pos_preds = []
     neg_preds = []
 
@@ -68,52 +83,63 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         v_pos = target[idx].item()
         v_negs = target_neg[idx]
 
-        if config_indices is not None and idx < len(config_indices):
-            cfg_idx = config_indices[idx].item()
+        # --- get subgraph (cached or live) ---
+        if cache is not None:
+            sub_data, u_sub, v_sub = cache.make_data(idx, data.x)
+            if sub_data is None:
+                pos_preds.append(0.5)
+                neg_preds.append([0.5] * num_neg_per_pos)
+                continue
+            selected_nodes = cache.selected_nodes[idx]
         else:
-            cfg_idx = 0
-        teleport_u, teleport_v = multi_scale_ppr.get_config_for_index(cfg_idx)
+            if config_indices is not None and idx < len(config_indices):
+                cfg_idx = config_indices[idx].item()
+            else:
+                cfg_idx = 0
+            teleport_u, teleport_v = multi_scale_ppr.get_config_for_index(cfg_idx)
 
-        ppr_u = multi_scale_ppr.get_ppr(u, teleport_u)
-        ppr_v = multi_scale_ppr.get_ppr(v_pos, teleport_v)
-        combined = w_u * ppr_u + w_v * ppr_v
+            ppr_u = multi_scale_ppr.get_ppr(u, teleport_u)
+            ppr_v = multi_scale_ppr.get_ppr(v_pos, teleport_v)
+            combined = w_u * ppr_u + w_v * ppr_v
 
-        k_actual = min(top_k, len(combined))
-        _, selected_nodes = torch.topk(combined, k_actual)
+            k_actual = min(top_k, len(combined))
+            _, selected_nodes = torch.topk(combined, k_actual)
 
-        dev = data.edge_index.device
-        selected_nodes = selected_nodes.detach().to(dev).long()
+            dev = data.edge_index.device
+            selected_nodes = selected_nodes.detach().to(dev).long()
 
-        if not (selected_nodes == u).any():
-            selected_nodes = torch.cat(
-                [selected_nodes, torch.tensor([u], device=dev, dtype=torch.long)])
-        if not (selected_nodes == v_pos).any():
-            selected_nodes = torch.cat(
-                [selected_nodes, torch.tensor([v_pos], device=dev, dtype=torch.long)])
+            if not (selected_nodes == u).any():
+                selected_nodes = torch.cat(
+                    [selected_nodes, torch.tensor([u], device=dev, dtype=torch.long)])
+            if not (selected_nodes == v_pos).any():
+                selected_nodes = torch.cat(
+                    [selected_nodes, torch.tensor([v_pos], device=dev, dtype=torch.long)])
 
-        edge_index_sub, _ = subgraph(
-            selected_nodes, data.edge_index,
-            relabel_nodes=True, num_nodes=data.num_nodes)
+            edge_index_sub, _ = subgraph(
+                selected_nodes, data.edge_index,
+                relabel_nodes=True, num_nodes=data.num_nodes)
 
-        node_mapping = {node.item(): new_idx
-                        for new_idx, node in enumerate(selected_nodes)}
-        u_sub = node_mapping.get(u, -1)
-        v_sub = node_mapping.get(v_pos, -1)
+            node_mapping = {node.item(): new_idx
+                            for new_idx, node in enumerate(selected_nodes)}
+            u_sub = node_mapping.get(u, -1)
+            v_sub = node_mapping.get(v_pos, -1)
 
-        if u_sub == -1 or v_sub == -1:
-            pos_preds.append(0.5)
-            neg_preds.append([0.5] * num_neg_per_pos)
-            continue
+            if u_sub == -1 or v_sub == -1:
+                pos_preds.append(0.5)
+                neg_preds.append([0.5] * num_neg_per_pos)
+                continue
 
-        x_sub = data.x[selected_nodes]
-        sub_data = Data(x=x_sub, edge_index=edge_index_sub).to(device)
+            x_sub = data.x[selected_nodes]
+            sub_data = Data(x=x_sub, edge_index=edge_index_sub)
 
+        sub_data = sub_data.to(device)
         h = encoder(sub_data.x, sub_data.edge_index)
 
         pos_pred = predictor(h[u_sub].unsqueeze(0), h[v_sub].unsqueeze(0))
         pos_preds.append(pos_pred.item())
 
         neg_pred_list = []
+        sel_dev = selected_nodes.device
         for v_neg in v_negs:
             v_neg_item = v_neg.item()
             node_mask = (selected_nodes == v_neg_item)
@@ -187,17 +213,14 @@ def evaluate_search_phase(model, arch_net, multi_scale_ppr, data,
 
 def _compute_all_metrics(pos_pred, neg_pred, K_values):
     """Compute MRR, AUC, AP, Hits@K from prediction tensors."""
-    # MRR
     ranks = 1 + (neg_pred >= pos_pred.unsqueeze(1)).sum(dim=1).float()
     mrr = (1.0 / ranks).mean().item()
 
-    # Hits@K
     hits = {}
     for k in K_values:
         if k <= neg_pred.size(1):
             hits[f'hits@{k}'] = (ranks <= k).float().mean().item()
 
-    # AUC / AP
     pos_np = pos_pred.numpy()
     neg_np = neg_pred.numpy().flatten()
     y_true = np.concatenate([np.ones(len(pos_np)), np.zeros(len(neg_np))])
