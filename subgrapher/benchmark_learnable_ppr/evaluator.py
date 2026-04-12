@@ -81,11 +81,18 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         k_actual = min(top_k, len(combined))
         _, selected_nodes = torch.topk(combined, k_actual)
 
+        edge_dev = data.edge_index.device
+        selected_nodes = selected_nodes.to(edge_dev)
+
         if u not in selected_nodes:
-            selected_nodes = torch.cat([selected_nodes, torch.tensor([u])])
+            selected_nodes = torch.cat([
+                selected_nodes,
+                torch.tensor([u], device=edge_dev, dtype=selected_nodes.dtype)])
         if v_pos not in selected_nodes:
-            selected_nodes = torch.cat([selected_nodes,
-                                        torch.tensor([v_pos])])
+            selected_nodes = torch.cat([
+                selected_nodes,
+                torch.tensor([v_pos], device=edge_dev,
+                             dtype=selected_nodes.dtype)])
 
         edge_index_sub, _ = subgraph(
             selected_nodes, data.edge_index,

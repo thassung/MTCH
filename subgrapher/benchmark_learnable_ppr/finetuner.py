@@ -70,10 +70,17 @@ class LearnablePPRExtractor:
         top_k_actual = min(self.top_k, len(combined))
         _, selected_nodes = torch.topk(combined, top_k_actual)
 
+        edge_dev = self.data.edge_index.device
+        selected_nodes = selected_nodes.to(edge_dev)
+
         if u not in selected_nodes:
-            selected_nodes = torch.cat([selected_nodes, torch.tensor([u])])
+            selected_nodes = torch.cat([
+                selected_nodes,
+                torch.tensor([u], device=edge_dev, dtype=selected_nodes.dtype)])
         if v not in selected_nodes:
-            selected_nodes = torch.cat([selected_nodes, torch.tensor([v])])
+            selected_nodes = torch.cat([
+                selected_nodes,
+                torch.tensor([v], device=edge_dev, dtype=selected_nodes.dtype)])
 
         edge_index_sub, _ = subgraph(
             selected_nodes, self.data.edge_index,
