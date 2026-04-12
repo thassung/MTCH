@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from datetime import datetime
 
+from tqdm import tqdm
+
 from ..utils.models import GCN, SAGE, GAT, LinkPredictor
 from ..benchmark.data_prep import prepare_link_prediction_data
 from .multi_scale_ppr import MultiScalePPR
@@ -22,6 +24,7 @@ from .finetuner import finetune_on_subgraphs
 from .evaluator import (evaluate_learnable_ppr, print_evaluation_results)
 
 
+# Defaults match `learnable_ppr.ipynb` / `_gen_notebook.py`
 DEFAULT_CONFIG = {
     'feature_method': 'random',
     'feature_dim': 128,
@@ -39,17 +42,22 @@ DEFAULT_CONFIG = {
     'arch_layers': 3,
     'temperature': 0.07,
     # Phase 2: Fine-tuning
-    'finetune_epochs': 500,
+    'finetune_epochs': 200,
     'finetune_batch_size': 8192,
     'finetune_lr': 0.005,
-    'finetune_patience': 30,
+    'finetune_patience': 20,
     'finetune_eval_steps': 5,
     'weight_decay': 1e-5,
     'grad_clip': 1.0,
+    'max_subgraphs_per_forward': 256,
+    'edges_per_epoch': 100_000,
+    'use_checkpoint_cache': True,
     # PPR
     'teleport_values': [0.50, 0.85, 0.95],
     'alpha': [0.5],
     'top_k': 100,
+    'datasets': ['FB15K237'],
+    'encoders': ['SAGE'],
 }
 
 
@@ -63,17 +71,26 @@ def create_encoder(encoder_type, in_channels, hidden_channels, num_layers,
                     num_layers, dropout)
     elif encoder_type == 'GAT':
         return GAT(in_channels, hidden_channels, hidden_channels,
-                   num_layers, dropout)
+                   num_layers, dropout, heads=4)
     raise ValueError(f"Unknown encoder type: {encoder_type}")
+
+
+def _alpha_for_json(alpha):
+    """Notebook stores a single float; API uses a one-element list."""
+    if isinstance(alpha, (list, tuple)):
+        if len(alpha) == 1:
+            return float(alpha[0])
+        return list(alpha)
+    return float(alpha)
 
 
 def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
                           device='cuda'):
     """Run full learnable PPR experiment for one dataset + encoder."""
-    print(f"\n{'=' * 80}")
-    print(f"Learnable PPR: {dataset_name} | {encoder_type}")
-    print(f"Teleport values: {config['teleport_values']}")
-    print(f"{'=' * 80}")
+    tqdm.write(f"\n{'=' * 80}")
+    tqdm.write(f"Learnable PPR: {dataset_name} | {encoder_type}")
+    tqdm.write(f"Teleport values: {config['teleport_values']}")
+    tqdm.write(f"{'=' * 80}")
 
     # ── Data ──
     print(f"\nLoading dataset: {dataset_path}")
@@ -176,6 +193,14 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
                      sum(p.numel() for p in ft_predictor.parameters()))
     print(f"  Fine-tune model params: {num_params_ft:,}")
 
+    if config.get('use_checkpoint_cache', True):
+        ckpt_dir = (
+            f'checkpoints/learnable-ppr/{dataset_name}/{encoder_type}')
+        cache_dir = f'cache/learnable-ppr/{dataset_name}/{encoder_type}'
+    else:
+        ckpt_dir = None
+        cache_dir = None
+
     ft_history = finetune_on_subgraphs(
         ft_encoder, ft_predictor, data, split_edge,
         multi_scale_ppr, train_configs,
@@ -190,6 +215,11 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         patience=config['finetune_patience'],
         weight_decay=config['weight_decay'],
         grad_clip=config['grad_clip'],
+        max_subgraphs_per_forward=config.get(
+            'max_subgraphs_per_forward', 256),
+        checkpoint_dir=ckpt_dir,
+        cache_dir=cache_dir,
+        edges_per_epoch=config.get('edges_per_epoch'),
     )
 
     # ── Test Evaluation ──
@@ -198,7 +228,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         ft_encoder, ft_predictor, data, split_edge,
         multi_scale_ppr, test_configs,
         split='test', alpha=config['alpha'], top_k=config['top_k'],
-        device=device)
+        device=device,
+        cache_dir=cache_dir)
     print_evaluation_results(test_results, 'test')
 
     # ── Save Results ──
@@ -213,9 +244,11 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         'teleport_values': config['teleport_values'],
         'num_configs': num_configs,
         'top_k': config['top_k'],
-        'alpha': config['alpha'],
+        'alpha': _alpha_for_json(config['alpha']),
         'search_time': search_history['total_time'],
         'finetune_time': ft_history.get('total_time', 0),
+        'finetune_best_mrr': ft_history['best_val_mrr'],
+        'finetune_best_epoch': ft_history['best_epoch'],
         'test_results': {k: float(v) for k, v in test_results.items()},
         'search_history': {
             'best_epoch': search_history['best_epoch'],
@@ -259,7 +292,7 @@ def _save_summary(save_dir, result):
         f.write(f"PPR Configuration:\n")
         f.write(f"  Teleport values: {result['teleport_values']}\n")
         f.write(f"  Num configs:     {result['num_configs']}\n")
-        f.write(f"  Alpha (fixed):   {result['alpha']}\n")
+        f.write(f"  Alpha (fixed):   {result['alpha']!r}\n")
         f.write(f"  Top-K:           {result['top_k']}\n\n")
 
         f.write(f"Timing:\n")
@@ -292,23 +325,36 @@ def run_learnable_ppr_benchmark(config=None):
         'NELL-995': 'data/NELL-995/train.txt',
     }
 
-    dataset_names = config.get('datasets', ['FB15K237', 'WN18RR', 'NELL-995'])
-    datasets = {n: dataset_paths[n] for n in dataset_names
-                if n in dataset_paths}
-    encoders = config.get('encoders', ['GCN', 'SAGE', 'GAT'])
+    dataset_names = config.get('datasets', DEFAULT_CONFIG['datasets'])
+    encoders = config.get('encoders', DEFAULT_CONFIG['encoders'])
     device = config.get('device', 'cuda')
+    show_run_bar = config.get('progress_experiments', True)
+
+    plan = []
+    for name in dataset_names:
+        if name not in dataset_paths:
+            tqdm.write(f"[Skip] Unknown dataset: {name}")
+            continue
+        for enc in encoders:
+            plan.append((name, dataset_paths[name], enc))
 
     all_results = []
-    for dataset_name, path in datasets.items():
-        for enc in encoders:
-            try:
-                result = run_single_experiment(
-                    dataset_name, path, enc, config, device)
-                all_results.append(result)
-            except Exception as e:
-                print(f"\nError in {dataset_name}_{enc}: {e}")
-                import traceback
-                traceback.print_exc()
+    run_iter = plan
+    if show_run_bar and plan:
+        run_iter = tqdm(
+            plan, desc='Learnable PPR (dataset×encoder)', unit='run')
+
+    for dataset_name, path, enc in run_iter:
+        if show_run_bar and plan:
+            run_iter.set_postfix_str(f'{dataset_name} | {enc}', refresh=False)
+        try:
+            result = run_single_experiment(
+                dataset_name, path, enc, config, device)
+            all_results.append(result)
+        except Exception as e:
+            tqdm.write(f"\nError in {dataset_name}_{enc}: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Aggregated results
     agg_path = 'results/benchmark-learnable-ppr/all_results.json'
@@ -334,25 +380,43 @@ def run_learnable_ppr_benchmark(config=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Learnable PPR Subgraph Benchmark')
+        description='Learnable PPR Subgraph Benchmark '
+ '(same pipeline as learnable_ppr.ipynb)')
     parser.add_argument('--datasets', nargs='+',
-                        default=['FB15K237', 'WN18RR', 'NELL-995'])
+                        default=DEFAULT_CONFIG['datasets'])
     parser.add_argument('--encoders', nargs='+',
-                        default=['GCN', 'SAGE', 'GAT'])
+                        default=DEFAULT_CONFIG['encoders'])
     parser.add_argument('--teleport_values', nargs='+', type=float,
                         default=[0.50, 0.85, 0.95],
                         help='Teleport probabilities for PPR search space')
     parser.add_argument('--top_k', type=int, default=100)
     parser.add_argument('--alpha', type=float, nargs='+', default=[0.5],
                         help='PPR combination weights (1 or 2 values)')
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default='auto',
+                        help="'cuda', 'cpu', or 'auto'")
     parser.add_argument('--search_epochs', type=int, default=50)
     parser.add_argument('--search_batch_size', type=int, default=1024)
-    parser.add_argument('--finetune_epochs', type=int, default=500)
+    parser.add_argument('--search_patience', type=int, default=50)
+    parser.add_argument('--finetune_epochs', type=int, default=200)
     parser.add_argument('--finetune_batch_size', type=int, default=8192)
+    parser.add_argument('--finetune_patience', type=int, default=20)
+    parser.add_argument('--max_subgraphs_per_forward', type=int, default=256)
+    parser.add_argument('--edges_per_epoch', type=int, default=100_000,
+                        help='Train edges per epoch (subsample);0 = all')
+    parser.add_argument('--no_checkpoint_cache', action='store_true',
+                        help='Disable checkpoints/ and cache/ writes')
+    parser.add_argument('--no_run_progress', action='store_true',
+                        help='Disable tqdm bar for dataset×encoder runs')
     parser.add_argument('--temperature', type=float, default=0.07)
 
     args = parser.parse_args()
+
+    if args.device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
+
+    edges_pe = args.edges_per_epoch if args.edges_per_epoch > 0 else None
 
     config = DEFAULT_CONFIG.copy()
     config.update({
@@ -361,13 +425,25 @@ def main():
         'teleport_values': sorted(args.teleport_values),
         'top_k': args.top_k,
         'alpha': args.alpha,
-        'device': args.device,
+        'device': device,
         'search_epochs': args.search_epochs,
         'search_batch_size': args.search_batch_size,
+        'search_patience': args.search_patience,
         'finetune_epochs': args.finetune_epochs,
         'finetune_batch_size': args.finetune_batch_size,
+        'finetune_patience': args.finetune_patience,
+        'max_subgraphs_per_forward': args.max_subgraphs_per_forward,
+        'edges_per_epoch': edges_pe,
+        'use_checkpoint_cache': not args.no_checkpoint_cache,
+        'progress_experiments': not args.no_run_progress,
         'temperature': args.temperature,
     })
+
+    tqdm.write(f'Device: {device}')
+    n_cfg = len(config['teleport_values']) ** 2
+    tqdm.write(
+        f"Search space: {len(config['teleport_values'])}×"
+        f"{len(config['teleport_values'])} = {n_cfg} configs")
 
     run_learnable_ppr_benchmark(config)
 
