@@ -43,7 +43,10 @@ def _to_serializable(obj):
 
 
 def _write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    path = str(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, 'w') as f:
         json.dump(_to_serializable(data), f, indent=2)
 
@@ -137,9 +140,9 @@ def save_learnable_ppr_experiment(
                      if multi_scale_ppr else [])
     config_dist = {
         'labels': config_labels,
-        'train': exp.get('train_counts'),
-        'val': exp.get('val_counts'),
-        'test': exp.get('test_counts'),
+        'train': _to_serializable(exp.get('train_counts')),
+        'val': _to_serializable(exp.get('val_counts')),
+        'test': _to_serializable(exp.get('test_counts')),
     }
     _write_json(str(run_dir / 'config_distributions.json'), config_dist)
 

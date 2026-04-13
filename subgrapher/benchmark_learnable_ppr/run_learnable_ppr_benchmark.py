@@ -22,6 +22,7 @@ from .search_net import PPRSearchNet
 from .searcher import ArchitectureSearcher
 from .finetuner import finetune_on_subgraphs
 from .evaluator import (evaluate_learnable_ppr, print_evaluation_results)
+from .artifacts import save_learnable_ppr_experiment
 
 
 # Defaults match `learnable_ppr.ipynb` / `_gen_notebook.py`
@@ -52,6 +53,7 @@ DEFAULT_CONFIG = {
     'max_subgraphs_per_forward': 256,
     'edges_per_epoch': 100_000,
     'use_checkpoint_cache': True,
+    'save_run_artifacts': True,
     # PPR
     'teleport_values': [0.50, 0.85, 0.95],
     'alpha': [0.5],
@@ -273,6 +275,47 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
 
     _save_summary(save_dir, result)
 
+    if config.get('save_run_artifacts', True):
+        run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = os.path.join(
+            save_dir, 'runs', run_id)
+        exp_bundle = {
+            'search_history': search_history,
+            'ft_history': ft_history,
+            'test_results': test_results,
+            'ft_encoder': ft_encoder,
+            'ft_predictor': ft_predictor,
+            'model': model,
+            'arch_net': arch_net,
+            'train_configs': train_configs,
+            'val_configs': val_configs,
+            'test_configs': test_configs,
+            'train_counts': train_counts,
+            'val_counts': val_counts,
+            'test_counts': test_counts,
+        }
+        extra_hp = {
+            'feature_dim': config['feature_dim'],
+            'hidden_channels': config['hidden_channels'],
+            'num_layers': config['num_layers'],
+            'dropout': config['dropout'],
+            'search_epochs': config['search_epochs'],
+            'search_batch_size': config['search_batch_size'],
+            'search_lr': config['search_lr'],
+            'search_patience': config['search_patience'],
+            'temperature': config['temperature'],
+            'finetune_epochs': config['finetune_epochs'],
+            'finetune_batch_size': config['finetune_batch_size'],
+            'finetune_lr': config['finetune_lr'],
+            'finetune_patience': config['finetune_patience'],
+            'device': str(device),
+        }
+        save_learnable_ppr_experiment(
+            run_dir, dataset_name, encoder_type, run_id,
+            config['teleport_values'], config['alpha'], config['top_k'],
+            exp_bundle, multi_scale_ppr, extra_config=extra_hp)
+        print(f"  Run artifacts: {run_dir}")
+
     print(f"\n  Results saved to: {save_dir}")
     print(f"  Test MRR: {test_results['mrr']:.4f}")
 
@@ -407,6 +450,8 @@ def main():
                         help='Disable checkpoints/ and cache/ writes')
     parser.add_argument('--no_run_progress', action='store_true',
                         help='Disable tqdm bar for dataset×encoder runs')
+    parser.add_argument('--no_run_artifacts', action='store_true',
+                        help='Skip results/.../runs/<id>/ JSON + checkpoints + config .pt')
     parser.add_argument('--temperature', type=float, default=0.07)
 
     args = parser.parse_args()
@@ -436,6 +481,7 @@ def main():
         'edges_per_epoch': edges_pe,
         'use_checkpoint_cache': not args.no_checkpoint_cache,
         'progress_experiments': not args.no_run_progress,
+        'save_run_artifacts': not args.no_run_artifacts,
         'temperature': args.temperature,
     })
 

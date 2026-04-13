@@ -5,7 +5,8 @@ Aggregates and compares results from all benchmark systems:
 1. Full Graph (results/benchmark/)
 2. Static PPR (results/benchmark-ppr/)
 3. Static k-hop (results/benchmark-khop/)
-4. Learnable PPR (results/subgraph/)
+4. Learnable PPR (results/benchmark-learnable-ppr/*/runs/*/manifest.json)
+5. Legacy learnable layout (results/subgraph/)
 
 Creates unified comparison tables and visualizations.
 """
@@ -112,37 +113,82 @@ def load_khop_results(base_dir='results/benchmark-khop'):
     return results
 
 
-def load_learnable_ppr_results(base_dir='results/subgraph'):
-    """Load results from learnable PPR benchmark."""
+def load_learnable_ppr_benchmark_runs(base_dir='results/benchmark-learnable-ppr'):
+    """Load learnable PPR runs from results/.../runs/<run_id>/manifest.json."""
     results = []
-    
     if not os.path.exists(base_dir):
         print(f"Warning: {base_dir} not found")
         return results
-    
-    # Scan for experiment directories
+
+    pattern = os.path.join(base_dir, '*', '*', 'runs', '*', 'manifest.json')
+    for manifest_path in glob.glob(pattern):
+        run_dir = os.path.dirname(manifest_path)
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            m = json.load(f)
+
+        test_path = os.path.join(run_dir, 'test_metrics.json')
+        if os.path.isfile(test_path):
+            with open(test_path, 'r', encoding='utf-8') as f:
+                metrics = json.load(f)
+        else:
+            metrics = m.get('test_summary') or {}
+
+        train_time = 0.0
+        if m.get('search') and m['search'].get('total_time') is not None:
+            train_time += float(m['search']['total_time'])
+        if m.get('finetune') and m['finetune'].get('total_time') is not None:
+            train_time += float(m['finetune']['total_time'])
+
+        top_k = m.get('top_k', '?')
+        teleport = m.get('teleport_values')
+        t_str = ''
+        if isinstance(teleport, list) and len(teleport) <= 5:
+            t_str = f"|t={teleport}"
+
+        results.append({
+            'method': 'Learnable PPR',
+            'dataset': m['dataset'],
+            'encoder': m['encoder'],
+            'config': f"top_k={top_k}{t_str}",
+            'mrr': float(metrics.get('mrr', 0)),
+            'auc': float(metrics.get('auc', 0)),
+            'ap': float(metrics.get('ap', 0)),
+            'hits@10': float(metrics.get('hits@10', 0)),
+            'train_time': train_time,
+        })
+
+    return results
+
+
+def load_learnable_ppr_results(base_dir='results/subgraph'):
+    """Load results from legacy learnable PPR benchmark (subgraph module layout)."""
+    results = []
+
+    if not os.path.exists(base_dir):
+        print(f"Warning: {base_dir} not found")
+        return results
+
     for dataset_dir in glob.glob(os.path.join(base_dir, '*')):
         if not os.path.isdir(dataset_dir):
             continue
-        
+
         dataset_name = os.path.basename(dataset_dir)
-        
+
         for exp_dir in glob.glob(os.path.join(dataset_dir, '*')):
             if not os.path.isdir(exp_dir):
                 continue
-            
-            # Load metrics
+
             metrics_path = os.path.join(exp_dir, 'metrics.json')
             config_path = os.path.join(exp_dir, 'config.json')
-            
+
             if os.path.exists(metrics_path) and os.path.exists(config_path):
                 with open(metrics_path, 'r') as f:
                     metrics = json.load(f)
                 with open(config_path, 'r') as f:
                     config = json.load(f)
-                
+
                 encoder = config.get('encoder', 'Unknown')
-                
+
                 results.append({
                     'method': 'Learnable PPR',
                     'dataset': dataset_name,
@@ -152,9 +198,10 @@ def load_learnable_ppr_results(base_dir='results/subgraph'):
                     'auc': metrics.get('auc', 0),
                     'ap': metrics.get('ap', 0),
                     'hits@10': metrics.get('hits@10', 0),
-                    'train_time': config.get('training_info', {}).get('total_time_seconds', 0)
+                    'train_time': config.get('training_info', {}).get(
+                        'total_time_seconds', 0),
                 })
-    
+
     return results
 
 
@@ -402,10 +449,15 @@ def main():
     all_results.extend(khop)
     print(f"  Found {len(khop)} results")
     
-    print("Loading Learnable PPR results...")
-    learnable = load_learnable_ppr_results()
-    all_results.extend(learnable)
-    print(f"  Found {len(learnable)} results")
+    print("Loading Learnable PPR results (benchmark-learnable-ppr runs/)...")
+    learnable_runs = load_learnable_ppr_benchmark_runs()
+    all_results.extend(learnable_runs)
+    print(f"  Found {len(learnable_runs)} run(s)")
+
+    print("Loading Learnable PPR results (legacy results/subgraph/)...")
+    learnable_legacy = load_learnable_ppr_results()
+    all_results.extend(learnable_legacy)
+    print(f"  Found {len(learnable_legacy)} legacy experiment(s)")
     
     print(f"\nTotal results: {len(all_results)}")
     
