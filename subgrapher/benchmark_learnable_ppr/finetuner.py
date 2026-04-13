@@ -19,6 +19,33 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import subgraph
 from tqdm import tqdm
+from datetime import datetime
+
+
+def _long_running_tqdm(iterable, desc, heartbeat_mins=10, **kwargs):
+    """tqdm generator: capped refresh rate + heartbeat timestamp every N mins."""
+    interval = float(os.environ.get('MTCH_TQDM_MININTERVAL', '5'))
+    has_len = hasattr(iterable, '__len__')
+    miniters = max(200, len(iterable) // 200) if has_len else 200
+    bar = tqdm(
+        iterable, desc=desc,
+        mininterval=interval, maxinterval=60, miniters=miniters,
+        **kwargs,
+    )
+    heartbeat_secs = heartbeat_mins * 60
+    last_hb = time.time()
+    try:
+        for item in bar:
+            yield item
+            now = time.time()
+            if now - last_hb >= heartbeat_secs:
+                last_hb = now
+                pct = bar.n / bar.total * 100 if bar.total else 0
+                tqdm.write(
+                    f'  [{datetime.now().strftime("%H:%M:%S")}] '
+                    f'{desc}: {bar.n}/{bar.total} ({pct:.0f}%)')
+    finally:
+        bar.close()
 
 
 class LearnablePPRExtractor:
@@ -150,7 +177,8 @@ class SubgraphCache:
         edge_index_cpu = extractor.data.edge_index.cpu()
         num_graph_nodes = extractor.data.num_nodes
 
-        it = tqdm(range(n), desc=f'Caching {split} subgraphs') if verbose else range(n)
+        it = (_long_running_tqdm(range(n), desc=f'Caching {split} subgraphs')
+              if verbose else range(n))
         for i in it:
             u = source[i].item()
             v = target[i].item()
@@ -314,7 +342,8 @@ def train_epoch_finetune(encoder, predictor, data, cache, optimizer,
 
     dataloader = DataLoader(indices.tolist(), batch_size, shuffle=False)
     if verbose:
-        dataloader = tqdm(dataloader, desc='  Fine-tune batches', leave=False)
+        dataloader = tqdm(dataloader, desc='  Fine-tune batches',
+                          leave=False, mininterval=2)
 
     x_full = data.x
 
@@ -473,6 +502,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                       f"(best MRR {best_val_mrr:.4f})")
 
     start = time.time()
+    last_heartbeat = time.time()
 
     iterator = range(start_epoch, epochs + 1)
     if verbose:
@@ -488,6 +518,12 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
             max_subgraphs_per_forward=max_subgraphs_per_forward,
             edges_per_epoch=edges_per_epoch)
         history['train_loss'].append(loss)
+
+        if time.time() - last_heartbeat >= 600:
+            last_heartbeat = time.time()
+            tqdm.write(
+                f'  [{datetime.now().strftime("%H:%M:%S")}] '
+                f'Fine-tuning epoch {epoch}/{epochs}, loss={loss:.4f}')
 
         if epoch % eval_steps == 0 or epoch == epochs:
             val_results = evaluate_learnable_ppr(

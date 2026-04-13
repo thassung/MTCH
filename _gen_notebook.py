@@ -46,10 +46,12 @@ code(
 "TEMPERATURE = 0.07\n"
 "\n"
 "# Phase 2: Fine-tuning\n"
-"FINETUNE_EPOCHS = 500\n"
+"FINETUNE_EPOCHS = 200\n"
 "FINETUNE_BATCH_SIZE = 8192\n"
 "FINETUNE_LR = 0.005\n"
-"FINETUNE_PATIENCE = 30\n"
+"FINETUNE_PATIENCE = 20\n"
+"MAX_SUBGRAPHS_PER_FORWARD = 256\n"
+"EDGES_PER_EPOCH = 100000           # subsample training edges per epoch (None = use all)\n"
 "\n"
 "import torch\n"
 "DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
@@ -73,7 +75,7 @@ code(
 "from subgrapher.benchmark_learnable_ppr.autolink_ppr import AutoLinkPPR\n"
 "from subgrapher.benchmark_learnable_ppr.search_net import PPRSearchNet\n"
 "from subgrapher.benchmark_learnable_ppr.searcher import ArchitectureSearcher\n"
-"from subgrapher.benchmark_learnable_ppr.finetuner import finetune_on_subgraphs, LearnablePPRExtractor\n"
+"from subgrapher.benchmark_learnable_ppr.finetuner import finetune_on_subgraphs, LearnablePPRExtractor, SubgraphCache, build_or_load_cache\n"
 "from subgrapher.benchmark_learnable_ppr.evaluator import evaluate_learnable_ppr, print_evaluation_results"
 )
 
@@ -226,6 +228,8 @@ code(
 
 md("## 5. Phase 2: Fine-tune on Extracted Subgraphs")
 
+md("### 5a. Build / load subgraph caches (one-time cost, saved to disk)")
+
 code(
 "def _create_encoder(enc_type, in_ch, hid, n_layers, dropout):\n"
 "    if enc_type == 'GCN': return GCN(in_ch, hid, hid, n_layers, dropout)\n"
@@ -238,22 +242,42 @@ code(
 "    data = r['data']; split_edge = r['split_edge']; msp = r['multi_scale_ppr']\n"
 "\n"
 "    for enc_type in ENCODERS:\n"
+"        exp = r['experiments'][enc_type]\n"
+"        exp['ft_encoder'] = _create_encoder(enc_type, FEATURE_DIM, HIDDEN_CHANNELS, NUM_LAYERS, DROPOUT)\n"
+"        exp['ft_predictor'] = LinkPredictor(HIDDEN_CHANNELS, HIDDEN_CHANNELS, 1, NUM_LAYERS, DROPOUT)\n"
+"        exp['ckpt_dir'] = f'checkpoints/learnable-ppr/{dataset_name}/{enc_type}'\n"
+"        exp['cache_dir'] = f'cache/learnable-ppr/{dataset_name}/{enc_type}'\n"
+"\n"
+"        print(f'\\n[Cache] {dataset_name} / {enc_type} (top_k={TOP_K})')\n"
+"        extractor = LearnablePPRExtractor(data, msp, exp['train_configs'], alpha=ALPHA, top_k=TOP_K)\n"
+"        build_or_load_cache(extractor, split_edge, 'train', exp['cache_dir'])\n"
+"\n"
+"print('Caches ready.')"
+)
+
+md("### 5b. Fine-tune (resumes from checkpoint if interrupted)")
+
+code(
+"for dataset_name in DATASETS:\n"
+"    r = all_results[dataset_name]\n"
+"    data = r['data']; split_edge = r['split_edge']; msp = r['multi_scale_ppr']\n"
+"\n"
+"    for enc_type in ENCODERS:\n"
 "        print(f'\\nPhase 2: {dataset_name} / {enc_type} (top_k={TOP_K})')\n"
 "        exp = r['experiments'][enc_type]\n"
 "\n"
-"        ft_encoder = _create_encoder(enc_type, FEATURE_DIM, HIDDEN_CHANNELS, NUM_LAYERS, DROPOUT)\n"
-"        ft_predictor = LinkPredictor(HIDDEN_CHANNELS, HIDDEN_CHANNELS, 1, NUM_LAYERS, DROPOUT)\n"
-"\n"
 "        ft_history = finetune_on_subgraphs(\n"
-"            ft_encoder, ft_predictor, data, split_edge,\n"
+"            exp['ft_encoder'], exp['ft_predictor'], data, split_edge,\n"
 "            msp, exp['train_configs'],\n"
 "            alpha=ALPHA, top_k=TOP_K,\n"
 "            epochs=FINETUNE_EPOCHS, batch_size=FINETUNE_BATCH_SIZE,\n"
 "            lr=FINETUNE_LR, eval_steps=5, device=DEVICE,\n"
-"            verbose=True, patience=FINETUNE_PATIENCE)\n"
+"            verbose=True, patience=FINETUNE_PATIENCE,\n"
+"            max_subgraphs_per_forward=MAX_SUBGRAPHS_PER_FORWARD,\n"
+"            checkpoint_dir=exp['ckpt_dir'],\n"
+"            cache_dir=exp['cache_dir'],\n"
+"            edges_per_epoch=EDGES_PER_EPOCH)\n"
 "\n"
-"        exp['ft_encoder'] = ft_encoder\n"
-"        exp['ft_predictor'] = ft_predictor\n"
 "        exp['ft_history'] = ft_history\n"
 "        print(f'Best MRR: {ft_history[\"best_val_mrr\"]:.4f} at epoch {ft_history[\"best_epoch\"]}')"
 )
@@ -267,10 +291,12 @@ code(
 "\n"
 "    for enc_type in ENCODERS:\n"
 "        exp = r['experiments'][enc_type]\n"
+"        cache_dir = f'cache/learnable-ppr/{dataset_name}/{enc_type}'\n"
 "        test_results = evaluate_learnable_ppr(\n"
 "            exp['ft_encoder'], exp['ft_predictor'],\n"
 "            data, split_edge, msp, exp['test_configs'],\n"
-"            split='test', alpha=ALPHA, top_k=TOP_K, device=DEVICE)\n"
+"            split='test', alpha=ALPHA, top_k=TOP_K, device=DEVICE,\n"
+"            cache_dir=cache_dir)\n"
 "        exp['test_results'] = test_results\n"
 "        print(f'\\n{dataset_name} / {enc_type}')\n"
 "        print_evaluation_results(test_results, 'test')"

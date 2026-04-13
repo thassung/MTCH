@@ -11,9 +11,6 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import subgraph
-from tqdm import tqdm
-
-
 @torch.no_grad()
 def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
                             multi_scale_ppr, config_indices,
@@ -47,7 +44,7 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
     """
     from . import resolve_alpha_weights
     from .finetuner import (LearnablePPRExtractor, SubgraphCache,
-                            build_or_load_cache)
+                            build_or_load_cache, _long_running_tqdm)
 
     if alpha is None:
         alpha = [0.5]
@@ -78,7 +75,8 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
     pos_preds = []
     neg_preds = []
 
-    for idx in tqdm(range(num_pos), desc=f'Eval {split}', leave=False):
+    for idx in _long_running_tqdm(
+            range(num_pos), desc=f'Eval {split}', leave=False):
         u = source[idx].item()
         v_pos = target[idx].item()
         v_negs = target_neg[idx]
