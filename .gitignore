@@ -13,3 +13,4 @@ tester.*
 
 *.pt
 preprocessed/
+results/
