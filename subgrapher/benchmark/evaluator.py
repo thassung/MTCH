@@ -43,7 +43,7 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
     
     # Compute positive predictions
     pos_preds = []
-    for perm in DataLoader(range(num_pos_edges), batch_size):
+    for perm in DataLoader(torch.arange(num_pos_edges), batch_size):
         src, dst = source[perm], target[perm]
         pos_preds.append(predictor(h[src], h[dst]).squeeze().cpu())
     pos_pred = torch.cat(pos_preds, dim=0)
@@ -53,7 +53,7 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
     source_repeated = source.view(-1, 1).repeat(1, num_neg_per_pos).view(-1)
     target_neg_flat = target_neg.view(-1)
     
-    for perm in DataLoader(range(source_repeated.size(0)), batch_size):
+    for perm in DataLoader(torch.arange(source_repeated.size(0)), batch_size):
         src, dst_neg = source_repeated[perm], target_neg_flat[perm]
         neg_preds.append(predictor(h[src], h[dst_neg]).squeeze().cpu())
     neg_pred = torch.cat(neg_preds, dim=0).view(num_pos_edges, num_neg_per_pos)

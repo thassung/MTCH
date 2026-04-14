@@ -38,7 +38,7 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
     total_examples = 0
     
     # Mini-batch training
-    for perm in DataLoader(range(source_edge.size(0)), batch_size, shuffle=True):
+    for perm in DataLoader(torch.arange(source_edge.size(0)), batch_size, shuffle=True):
         optimizer.zero_grad()
         
         # Encode all nodes

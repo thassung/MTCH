@@ -404,7 +404,7 @@ class ArchitectureSearcher:
 
         total_loss = 0.0
         count = 0
-        for perm in DataLoader(range(num_val), batch_size, shuffle=False):
+        for perm in DataLoader(torch.arange(num_val), batch_size, shuffle=False):
             src = val_src[perm]
             dst = val_dst[perm]
             edge = torch.stack([src, dst], dim=0)
@@ -436,7 +436,7 @@ class ArchitectureSearcher:
         all_indices = []
         h = self.model(self.data.x, self.data.edge_index)
 
-        for perm in DataLoader(range(num_edges), batch_size, shuffle=False):
+        for perm in DataLoader(torch.arange(num_edges), batch_size, shuffle=False):
             edges = torch.stack([src[perm], dst[perm]], dim=0)
             cross = self.multi_scale_ppr.get_ppr_cross_pair_batch(
                 edges[0], edges[1], h)

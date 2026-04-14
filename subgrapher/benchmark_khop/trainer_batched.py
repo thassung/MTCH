@@ -48,7 +48,7 @@ def train_epoch_khop_batched(encoder, predictor, data, split_edge, khop_extracto
     total_examples = 0
     
     # Mini-batch training
-    dataloader = DataLoader(range(source_edge.size(0)), batch_size, shuffle=True)
+    dataloader = DataLoader(torch.arange(source_edge.size(0)), batch_size, shuffle=True)
     if verbose:
         dataloader = tqdm(dataloader, desc='  Training batches', leave=False)
     

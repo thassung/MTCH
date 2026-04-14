@@ -181,7 +181,7 @@ def evaluate_search_phase(model, arch_net, multi_scale_ppr, data,
     pos_preds = []
     neg_preds_flat = []
 
-    for perm in DataLoader(range(num_pos), batch_size, shuffle=False):
+    for perm in DataLoader(torch.arange(num_pos), batch_size, shuffle=False):
         src = source[perm]
         dst = target[perm]
         edges = torch.stack([src, dst], dim=0)
