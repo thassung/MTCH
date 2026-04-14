@@ -410,7 +410,8 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                            max_subgraphs_per_forward=256,
                            checkpoint_dir=None,
                            cache_dir=None,
-                           edges_per_epoch=None):
+                           edges_per_epoch=None,
+                           val_config_indices=None):
     """
     Phase 2: Fine-tune encoder+predictor on subgraphs with learned configs.
 
@@ -439,12 +440,16 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
             If None, caches are built in memory only (not persisted).
         edges_per_epoch: If set, subsample this many training edges per
             epoch instead of using all.  Greatly reduces epoch time.
+        val_config_indices: Tensor [num_val_edges] of config per validation
+            edge. If None, falls back to config_indices (legacy behavior).
 
     Returns:
         history: Training history dict
     """
     if alpha is None:
         alpha = [0.5]
+    if val_config_indices is None:
+        val_config_indices = config_indices
     from .evaluator import evaluate_learnable_ppr
 
     encoder = encoder.to(device)
@@ -525,7 +530,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         if epoch % eval_steps == 0 or epoch == epochs:
             val_results = evaluate_learnable_ppr(
                 encoder, predictor, data, split_edge,
-                multi_scale_ppr, config_indices,
+                multi_scale_ppr, val_config_indices,
                 split='valid', alpha=alpha, top_k=top_k,
                 batch_size=batch_size, device=device,
                 cache_dir=cache_dir)

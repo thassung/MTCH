@@ -38,11 +38,10 @@ DEFAULT_CONFIG = {
     'search_lr': 0.01,
     'search_lr_arch': 0.01,
     'search_lr_min': 0.001,
-    'search_patience': 50,
     'arch_hidden': 256,
     'arch_layers': 3,
     'temperature_start': 1.0,
-    'temperature_end': 0.07,
+    'temperature_end': 0.2,
     'edges_per_search_epoch': 100_000,
     'first_order': True,
     'gpu_ppr': True,
@@ -165,7 +164,6 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
     search_history = searcher.search(
         epochs=config['search_epochs'],
         batch_size=config['search_batch_size'],
-        patience=config['search_patience'],
         verbose=True,
         val_every=config.get('search_val_every', 5),
         use_amp=config.get('use_amp', False),
@@ -235,6 +233,7 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         checkpoint_dir=ckpt_dir,
         cache_dir=cache_dir,
         edges_per_epoch=config.get('edges_per_epoch'),
+        val_config_indices=val_configs,
     )
 
     # ── Test Evaluation ──
@@ -315,9 +314,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
             'search_epochs': config['search_epochs'],
             'search_batch_size': config['search_batch_size'],
             'search_lr': config['search_lr'],
-            'search_patience': config['search_patience'],
             'temperature_start': config.get('temperature_start', 1.0),
-            'temperature_end': config.get('temperature_end', 0.07),
+            'temperature_end': config.get('temperature_end', 0.2),
             'finetune_epochs': config['finetune_epochs'],
             'finetune_batch_size': config['finetune_batch_size'],
             'finetune_lr': config['finetune_lr'],
@@ -453,7 +451,6 @@ def main():
                         help="'cuda', 'cpu', or 'auto'")
     parser.add_argument('--search_epochs', type=int, default=50)
     parser.add_argument('--search_batch_size', type=int, default=1024)
-    parser.add_argument('--search_patience', type=int, default=50)
     parser.add_argument('--finetune_epochs', type=int, default=200)
     parser.add_argument('--finetune_batch_size', type=int, default=8192)
     parser.add_argument('--finetune_patience', type=int, default=20)
@@ -468,7 +465,7 @@ def main():
                         help='Skip results/.../runs/<id>/ JSON + checkpoints + config .pt')
     parser.add_argument('--temperature_start', type=float, default=1.0,
                         help='Starting softmax temperature (annealing)')
-    parser.add_argument('--temperature_end', type=float, default=0.07,
+    parser.add_argument('--temperature_end', type=float, default=0.2,
                         help='Ending softmax temperature (annealing)')
     parser.add_argument('--edges_per_search_epoch', type=int, default=0,
                         help='Subsample training edges per search epoch; 0 = all')
@@ -494,7 +491,6 @@ def main():
         'device': device,
         'search_epochs': args.search_epochs,
         'search_batch_size': args.search_batch_size,
-        'search_patience': args.search_patience,
         'finetune_epochs': args.finetune_epochs,
         'finetune_batch_size': args.finetune_batch_size,
         'finetune_patience': args.finetune_patience,

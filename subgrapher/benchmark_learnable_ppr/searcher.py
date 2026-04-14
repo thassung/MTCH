@@ -2,6 +2,7 @@
 Bi-level architecture search for learnable PPR configuration.
 
 Phase 1: Learns per-edge (teleport_u, teleport_v) selection on the full graph.
+Temperature annealing controls the training horizon -- no early stopping needed.
 """
 
 import torch
@@ -73,10 +74,13 @@ class ArchitectureSearcher:
     For each batch:
       1. v_model = copy(model), v_arch = copy(arch_net)
       2. Inner step: train v_model + v_arch on train batch
-      3. Compute val loss with v_model + v_arch
+      3. Compute val loss with v_model + v_arch (gradient only, no optimizer step)
       4. Hessian-vector product for second-order gradients (skipped if first_order)
       5. Update arch_net with implicit gradients
       6. Update model on train batch with frozen arch_net
+
+    Temperature annealing controls the training horizon. No early stopping is used;
+    the full epoch budget runs to allow the temperature to anneal completely.
 
     Args:
         model: AutoLinkPPR instance
@@ -89,14 +93,14 @@ class ArchitectureSearcher:
         lr_arch: Learning rate for arch_net
         lr_min: Minimum learning rate for cosine scheduler
         temperature_start: Starting temperature for annealing (default 1.0)
-        temperature_end: Ending temperature for annealing (default 0.07)
+        temperature_end: Ending temperature for annealing (default 0.2)
         edges_per_search_epoch: Subsample training edges per epoch (None = all)
         first_order: If True, skip HVP (first-order DARTS approximation)
     """
 
     def __init__(self, model, arch_net, multi_scale_ppr, data, split_edge,
                  device='cuda', lr=0.01, lr_arch=0.01, lr_min=0.001,
-                 temperature_start=1.0, temperature_end=0.07,
+                 temperature_start=1.0, temperature_end=0.2,
                  edges_per_search_epoch=None, first_order=False):
         self.model = model.to(device)
         self.arch_net = arch_net.to(device)
@@ -110,7 +114,7 @@ class ArchitectureSearcher:
 
         self.optimizer = torch.optim.Adam(
             list(model.parameters()), lr=lr)
-        self.v_optimizer = torch.optim.Adam(
+        self.v_optimizer = torch.optim.SGD(
             list(self.v_model.parameters()) +
             list(self.v_arch_net.parameters()),
             lr=lr)
@@ -145,15 +149,14 @@ class ArchitectureSearcher:
         frac = epoch / (total_epochs - 1)
         return self.temperature_start + frac * (self.temperature_end - self.temperature_start)
 
-    def search(self, epochs=50, batch_size=1024, patience=50, verbose=True,
-               val_every=5, use_amp=False):
+    def search(self, epochs=50, batch_size=1024, verbose=True,
+               val_every=5, use_amp=False, **kwargs):
         """
         Run architecture search.
 
         Args:
             epochs: Number of search epochs
             batch_size: Edges per batch
-            patience: Early stopping patience (in epochs)
             verbose: Show tqdm progress
             val_every: Run full validation every N epochs (default 5)
             use_amp: Enable mixed-precision (float16) for forward/backward
@@ -165,7 +168,6 @@ class ArchitectureSearcher:
             self.optimizer, T_max=epochs, eta_min=self.lr_min)
 
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        v_scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         pos_train_source = self.split_edge['train']['source_node'].to(
             self.device)
@@ -195,7 +197,6 @@ class ArchitectureSearcher:
         }
 
         best_val_loss = float('inf')
-        cnt_wait = 0
         start_time = time.time()
 
         iterator = tqdm(range(epochs), desc='Arch Search') if verbose else range(epochs)
@@ -236,14 +237,12 @@ class ArchitectureSearcher:
                         h, self.v_arch_net, self.multi_scale_ppr,
                         train_edge, train_edge_neg)
 
-                v_scaler.scale(loss_inner).backward()
-                v_scaler.unscale_(self.v_optimizer)
+                loss_inner.backward()
                 nn.utils.clip_grad_norm_(self.v_model.parameters(), 1.0)
                 nn.utils.clip_grad_norm_(self.v_arch_net.parameters(), 1.0)
-                v_scaler.step(self.v_optimizer)
-                v_scaler.update()
+                self.v_optimizer.step()
 
-                # Step 3: Validation loss with v_model + v_arch
+                # Step 3: Val loss for meta-gradient (no optimizer step, no scaler)
                 val_perm = val_perm_gen.next(self.device)
                 val_src = pos_valid_source[val_perm]
                 val_dst = pos_valid_target[val_perm]
@@ -257,8 +256,7 @@ class ArchitectureSearcher:
                         h_v, self.v_arch_net, self.multi_scale_ppr,
                         valid_edge, valid_edge_neg)
 
-                v_scaler.scale(loss_val).backward()
-                v_scaler.unscale_(self.v_optimizer)
+                loss_val.backward()
                 nn.utils.clip_grad_norm_(self.v_model.parameters(), 1.0)
                 nn.utils.clip_grad_norm_(self.v_arch_net.parameters(), 1.0)
 
@@ -311,7 +309,6 @@ class ArchitectureSearcher:
             history['search_loss'].append(avg_loss)
             history['temperature'].append(temp)
 
-            # Diagnostics: embedding norms + arch entropy (lightweight)
             with torch.no_grad():
                 h_diag = self.model(self.data.x, self.data.edge_index)
                 h_norms = h_diag.norm(dim=-1)
@@ -323,7 +320,6 @@ class ArchitectureSearcher:
             history['arch_entropy'].append(arch_entropy)
             history['softmax_mass_top1'].append(mass_top1)
 
-            # Periodic config distribution snapshots
             snapshot_epochs = {0, epochs // 3, 2 * epochs // 3, epochs - 1}
             if epoch in snapshot_epochs:
                 _, counts = self.get_edge_configs('train', batch_size=4096)
@@ -332,7 +328,6 @@ class ArchitectureSearcher:
                     'train_counts': counts.tolist(),
                 })
 
-            # Full validation every val_every epochs (or first/last)
             do_val = (epoch % val_every == 0) or (epoch == epochs - 1) or (epoch == 0)
             if do_val:
                 val_loss = self._evaluate_val_loss(batch_size)
@@ -342,13 +337,10 @@ class ArchitectureSearcher:
                     best_val_loss = val_loss
                     history['best_val_loss'] = best_val_loss
                     history['best_epoch'] = epoch
-                    cnt_wait = 0
                     history['best_model_state'] = copy.deepcopy(
                         self.model.state_dict())
                     history['best_arch_state'] = copy.deepcopy(
                         self.arch_net.state_dict())
-                else:
-                    cnt_wait += 1
             else:
                 history['val_loss'].append(None)
 
@@ -361,15 +353,9 @@ class ArchitectureSearcher:
                 if history['val_loss'][-1] is not None:
                     postfix['val'] = f'{history["val_loss"][-1]:.4f}'
                 postfix['best'] = f'{best_val_loss:.4f}'
-                postfix['wait'] = f'{cnt_wait}/{patience}'
                 iterator.set_postfix(postfix)
 
             scheduler.step()
-
-            if cnt_wait >= patience:
-                if verbose:
-                    print(f"\n[Early Stop] epoch {epoch}")
-                break
 
         history['total_time'] = time.time() - start_time
 
