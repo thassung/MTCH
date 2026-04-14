@@ -31,8 +31,8 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
     encoder.train()
     predictor.train()
     
-    source_edge = split_edge['train']['source_node'].to(device)
-    target_edge = split_edge['train']['target_node'].to(device)
+    source_edge = split_edge['train']['source_node']
+    target_edge = split_edge['train']['target_node']
     
     total_loss = 0
     total_examples = 0
@@ -41,11 +41,12 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
     for perm in DataLoader(torch.arange(source_edge.size(0)), batch_size, shuffle=True):
         optimizer.zero_grad()
         
-        # Encode all nodes
+        # Encode all nodes (data already on device via train_model)
         h = encoder(data.x, data.edge_index)
         
-        # Get positive edges
-        src, dst = source_edge[perm], target_edge[perm]
+        # Get positive edges (move batch slice to device)
+        src = source_edge[perm].to(device)
+        dst = target_edge[perm].to(device)
         
         # Positive predictions
         pos_out = predictor(h[src], h[dst])
@@ -104,10 +105,11 @@ def train_model(encoder, predictor, data, split_edge,
     Returns:
         Dictionary with training history
     """
-    # Move models and data to device
+    # Move models to device; keep only graph tensors on GPU
     encoder = encoder.to(device)
     predictor = predictor.to(device)
-    data = data.to(device)
+    data.x = data.x.to(device)
+    data.edge_index = data.edge_index.to(device)
     
     # Optimizer with weight decay (L2 regularization)
     optimizer = torch.optim.Adam(
@@ -223,6 +225,11 @@ def train_model(encoder, predictor, data, split_edge,
         if verbose:
             print(f"[Checkpoint] Restored best model from epoch {history['best_epoch']}")
     
+    # Move graph data back to CPU to free GPU memory
+    data.x = data.x.cpu()
+    data.edge_index = data.edge_index.cpu()
+    torch.cuda.empty_cache()
+    
     # Final summary
     if verbose:
         print(f"\n{'='*60}")
@@ -292,6 +299,11 @@ def benchmark_model(model_name, encoder, predictor, data, split_edge,
     )
     
     print_evaluation_results(test_results, model_name=model_name, split='Test')
+    
+    # Release GPU memory
+    encoder.cpu()
+    predictor.cpu()
+    torch.cuda.empty_cache()
     
     return {
         'model_name': model_name,

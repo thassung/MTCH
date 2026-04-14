@@ -30,33 +30,43 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
     device = next(encoder.parameters()).device
     
     # Encode all nodes once
-    with torch.no_grad():
-        h = encoder(data.x.to(device), data.edge_index.to(device))
+    h = encoder(data.x.to(device), data.edge_index.to(device))
     
-    # Get positive and negative edges
-    source = split_edge[split]['source_node'].to(device)
-    target = split_edge[split]['target_node'].to(device)
-    target_neg = split_edge[split]['target_node_neg'].to(device)
+    # Keep heavy tensors on CPU; only move batch-sized slices to GPU
+    source = split_edge[split]['source_node']
+    target = split_edge[split]['target_node']
+    target_neg = split_edge[split]['target_node_neg']
     
     num_pos_edges = source.size(0)
     num_neg_per_pos = target_neg.size(1)
     
-    # Compute positive predictions
+    eval_bs = min(batch_size, 4096)
+    
     pos_preds = []
-    for perm in DataLoader(torch.arange(num_pos_edges), batch_size):
-        src, dst = source[perm], target[perm]
-        pos_preds.append(predictor(h[src], h[dst]).squeeze().cpu())
-    pos_pred = torch.cat(pos_preds, dim=0)
-    
-    # Compute negative predictions
     neg_preds = []
-    source_repeated = source.view(-1, 1).repeat(1, num_neg_per_pos).view(-1)
-    target_neg_flat = target_neg.view(-1)
     
-    for perm in DataLoader(torch.arange(source_repeated.size(0)), batch_size):
-        src, dst_neg = source_repeated[perm], target_neg_flat[perm]
-        neg_preds.append(predictor(h[src], h[dst_neg]).squeeze().cpu())
-    neg_pred = torch.cat(neg_preds, dim=0).view(num_pos_edges, num_neg_per_pos)
+    for perm in DataLoader(torch.arange(num_pos_edges), eval_bs):
+        src = source[perm].to(device)
+        dst = target[perm].to(device)
+        pos_preds.append(predictor(h[src], h[dst]).squeeze().cpu())
+        
+        # Negatives for this chunk only (never all at once)
+        dst_neg_chunk = target_neg[perm].to(device)          # [chunk, neg_per_pos]
+        src_rep = src.unsqueeze(1).expand_as(dst_neg_chunk).reshape(-1)
+        dst_neg_flat = dst_neg_chunk.reshape(-1)
+        
+        chunk_neg = []
+        for neg_start in range(0, src_rep.size(0), eval_bs):
+            neg_end = min(neg_start + eval_bs, src_rep.size(0))
+            chunk_neg.append(
+                predictor(h[src_rep[neg_start:neg_end]],
+                          h[dst_neg_flat[neg_start:neg_end]]).squeeze().cpu())
+        neg_preds.append(torch.cat(chunk_neg).view(len(perm), num_neg_per_pos))
+        
+        del src, dst, dst_neg_chunk, src_rep, dst_neg_flat, chunk_neg
+    
+    pos_pred = torch.cat(pos_preds, dim=0)
+    neg_pred = torch.cat(neg_preds, dim=0)
     
     # Compute MRR (Mean Reciprocal Rank)
     mrr = compute_mrr(pos_pred, neg_pred)
