@@ -152,8 +152,10 @@ code(
 md("## 2. Full Graph (No Subgraph)")
 
 code(
-"from subgrapher.benchmark.trainer import benchmark_model\n"
-"\n"
+"from subgrapher.benchmark.trainer import benchmark_model"
+)
+
+code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
 "    data = dd['data'].clone()\n"
@@ -195,7 +197,18 @@ code(
 "                    'dropout': DROPOUT,\n"
 "                },\n"
 "                'seed': SEED,\n"
-"            })"
+"            })\n"
+"\n"
+"        del encoder, predictor, result\n"
+"        torch.cuda.empty_cache()"
+)
+
+code(
+"import gc\n"
+"del data, split_edge\n"
+"gc.collect()\n"
+"torch.cuda.empty_cache()\n"
+"print('Full Graph done — GPU memory released.')"
 )
 
 # ── Static PPR ────────────────────────────────────────────────────────────────
@@ -205,8 +218,10 @@ code(
 "from subgrapher.benchmark_ppr.run_ppr_benchmark import load_or_create_ppr_preprocessor\n"
 "from subgrapher.benchmark_ppr.ppr_extractor import StaticPPRExtractor\n"
 "from subgrapher.benchmark_ppr.trainer_batched import train_model_ppr_batched\n"
-"from subgrapher.benchmark_ppr.evaluator import evaluate_ppr\n"
-"\n"
+"from subgrapher.benchmark_ppr.evaluator import evaluate_ppr"
+)
+
+code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
 "    data = dd['data']; split_edge = dd['split_edge']\n"
@@ -261,7 +276,20 @@ code(
 "                        'dropout': DROPOUT,\n"
 "                    },\n"
 "                    'seed': SEED,\n"
-"                })"
+"                })\n"
+"\n"
+"            del encoder, predictor, hist, test_res\n"
+"            torch.cuda.empty_cache()\n"
+"\n"
+"        del ppr_ext\n"
+"\n"
+"    del ppr_pre"
+)
+
+code(
+"gc.collect()\n"
+"torch.cuda.empty_cache()\n"
+"print('Static PPR done — GPU memory released.')"
 )
 
 # ── Static k-hop ─────────────────────────────────────────────────────────────
@@ -271,8 +299,10 @@ code(
 "from subgrapher.benchmark_khop.run_khop_benchmark import load_or_create_khop_preprocessor\n"
 "from subgrapher.benchmark_khop.khop_extractor import StaticKHopExtractor\n"
 "from subgrapher.benchmark_khop.trainer_batched import train_model_khop_batched\n"
-"from subgrapher.benchmark_khop.evaluator import evaluate_khop\n"
-"\n"
+"from subgrapher.benchmark_khop.evaluator import evaluate_khop"
+)
+
+code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
 "    data = dd['data']; split_edge = dd['split_edge']\n"
@@ -323,7 +353,18 @@ code(
 "                        'dropout': DROPOUT,\n"
 "                    },\n"
 "                    'seed': SEED,\n"
-"                })"
+"                })\n"
+"\n"
+"            del encoder, predictor, hist, test_res\n"
+"            torch.cuda.empty_cache()\n"
+"\n"
+"        del khop_ext, khop_pre"
+)
+
+code(
+"gc.collect()\n"
+"torch.cuda.empty_cache()\n"
+"print('Static k-hop done — GPU memory released.')"
 )
 
 # ── Summary ───────────────────────────────────────────────────────────────────
