@@ -43,8 +43,11 @@ DEFAULT_CONFIG = {
     'arch_layers': 3,
     'temperature_start': 1.0,
     'temperature_end': 0.07,
-    'edges_per_search_epoch': None,
-    'first_order': False,
+    'edges_per_search_epoch': 100_000,
+    'first_order': True,
+    'gpu_ppr': True,
+    'search_val_every': 5,
+    'use_amp': True,
     # Phase 2: Fine-tuning
     'finetune_epochs': 200,
     'finetune_batch_size': 8192,
@@ -114,7 +117,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
     print(f"\nLoading multi-scale PPR...")
     multi_scale_ppr = MultiScalePPR(
         dataset_name, data,
-        teleport_values=config['teleport_values'])
+        teleport_values=config['teleport_values'],
+        device=device if config.get('gpu_ppr', True) else None)
     print(f"  {multi_scale_ppr}")
 
     num_configs = multi_scale_ppr.num_configs
@@ -163,6 +167,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         batch_size=config['search_batch_size'],
         patience=config['search_patience'],
         verbose=True,
+        val_every=config.get('search_val_every', 5),
+        use_amp=config.get('use_amp', False),
     )
 
     # Get learned configs for all splits
