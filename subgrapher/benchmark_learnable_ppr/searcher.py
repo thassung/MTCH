@@ -28,7 +28,7 @@ def _hessian_vector_product(vector, dalpha_, model, arch_net,
     using finite difference: [grad_alpha L(w+Rv, alpha) - grad_alpha L(w-Rv, alpha)] / 2R
     """
     all_vector = vector + dalpha_
-    R = r / _concat(all_vector).norm()
+    R = r / (_concat(all_vector).norm() + 1e-8)
 
     # w+ = w + R * v
     for p, v in zip(model.parameters(), vector):
@@ -64,19 +64,6 @@ def _hessian_vector_product(vector, dalpha_, model, arch_net,
     return [(x - y).div_(2 * R) for x, y in zip(grads_p, grads_n)]
 
 
-def _generate_neg_edges(split_edge, num_nodes, device, sample_size):
-    """Generate negative edge samples for training."""
-    pos_edge = torch.stack([
-        split_edge['train']['source_node'],
-        split_edge['train']['target_node']
-    ], dim=0)
-    new_edge_index, _ = add_self_loops(pos_edge)
-    neg_edge = negative_sampling(
-        new_edge_index, num_nodes=num_nodes,
-        num_neg_samples=sample_size)
-    return neg_edge.to(device)
-
-
 class ArchitectureSearcher:
     """
     Bi-level architecture search for PPR configuration.
@@ -100,10 +87,16 @@ class ArchitectureSearcher:
         lr: Learning rate for model
         lr_arch: Learning rate for arch_net
         lr_min: Minimum learning rate for cosine scheduler
+        temperature_start: Starting temperature for annealing (default 1.0)
+        temperature_end: Ending temperature for annealing (default 0.07)
+        edges_per_search_epoch: Subsample training edges per epoch (None = all)
+        first_order: If True, skip HVP (first-order DARTS approximation)
     """
 
     def __init__(self, model, arch_net, multi_scale_ppr, data, split_edge,
-                 device='cuda', lr=0.01, lr_arch=0.01, lr_min=0.001):
+                 device='cuda', lr=0.01, lr_arch=0.01, lr_min=0.001,
+                 temperature_start=1.0, temperature_end=0.07,
+                 edges_per_search_epoch=None, first_order=False):
         self.model = model.to(device)
         self.arch_net = arch_net.to(device)
         self.multi_scale_ppr = multi_scale_ppr
@@ -125,13 +118,39 @@ class ArchitectureSearcher:
 
         self.lr = lr
         self.lr_min = lr_min
+        self.temperature_start = temperature_start
+        self.temperature_end = temperature_end
+        self.edges_per_search_epoch = edges_per_search_epoch
+        self.first_order = first_order
+
+        # Pre-compute self-loop-augmented edge index for negative sampling
+        pos_edge = torch.stack([
+            split_edge['train']['source_node'],
+            split_edge['train']['target_node']
+        ], dim=0)
+        self._neg_edge_index, _ = add_self_loops(pos_edge)
+        self._neg_edge_index = self._neg_edge_index.to(device)
+
+    def _generate_neg_edges(self, sample_size):
+        """Generate negative edge samples using pre-computed self-loop edge index."""
+        neg_edge = negative_sampling(
+            self._neg_edge_index, num_nodes=self.data.num_nodes,
+            num_neg_samples=sample_size)
+        return neg_edge.to(self.device)
+
+    def _get_temperature(self, epoch, total_epochs):
+        """Linear temperature annealing from start to end."""
+        if total_epochs <= 1:
+            return self.temperature_end
+        frac = epoch / (total_epochs - 1)
+        return self.temperature_start + frac * (self.temperature_end - self.temperature_start)
 
     def search(self, epochs=50, batch_size=1024, patience=50, verbose=True):
         """
         Run architecture search.
 
         Returns:
-            history: Dict with search metrics
+            history: Dict with search metrics and diagnostics
         """
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=epochs, eta_min=self.lr_min)
@@ -156,6 +175,12 @@ class ArchitectureSearcher:
             'best_val_loss': float('inf'),
             'best_epoch': 0,
             'total_time': 0.0,
+            # Diagnostics (Lucy / Norman)
+            'temperature': [],
+            'arch_entropy': [],
+            'softmax_mass_top1': [],
+            'embedding_norm_mean': [],
+            'embedding_norm_max': [],
         }
 
         best_val_loss = float('inf')
@@ -165,22 +190,30 @@ class ArchitectureSearcher:
         iterator = tqdm(range(epochs), desc='Arch Search') if verbose else range(epochs)
 
         for epoch in iterator:
-            scheduler.step()
-            lr_current = scheduler.get_last_lr()[-1]
+            # Temperature annealing
+            temp = self._get_temperature(epoch, epochs)
+            self.arch_net.set_temperature(temp)
+            self.v_arch_net.set_temperature(temp)
+
+            lr_current = self.optimizer.param_groups[0]['lr']
             epoch_loss = 0.0
             steps = 0
 
+            # Edge subsampling for Phase 1 speedup
+            if (self.edges_per_search_epoch is not None
+                    and self.edges_per_search_epoch < num_train):
+                epoch_indices = torch.randperm(num_train)[:self.edges_per_search_epoch]
+            else:
+                epoch_indices = torch.arange(num_train)
+
             self.model.train()
-            for perm in DataLoader(range(num_train), batch_size, shuffle=True):
+            for perm in DataLoader(epoch_indices, batch_size, shuffle=True):
                 self.arch_net.train()
 
-                # Edges for this batch
                 train_src = pos_train_source[perm]
                 train_dst = pos_train_target[perm]
                 train_edge = torch.stack([train_src, train_dst], dim=0)
-                train_edge_neg = _generate_neg_edges(
-                    self.split_edge, self.data.num_nodes, self.device,
-                    len(perm))
+                train_edge_neg = self._generate_neg_edges(len(perm))
 
                 # Step 1: Copy model -> v_model
                 self.v_model.load_state_dict(self.model.state_dict())
@@ -203,9 +236,7 @@ class ArchitectureSearcher:
                 val_src = pos_valid_source[val_perm]
                 val_dst = pos_valid_target[val_perm]
                 valid_edge = torch.stack([val_src, val_dst], dim=0)
-                valid_edge_neg = _generate_neg_edges(
-                    self.split_edge, self.data.num_nodes, self.device,
-                    len(val_perm))
+                valid_edge_neg = self._generate_neg_edges(len(val_perm))
 
                 h_v = self.v_model(self.data.x, self.data.edge_index)
                 loss_val = self.v_model.compute_loss(
@@ -217,18 +248,22 @@ class ArchitectureSearcher:
                 nn.utils.clip_grad_norm_(self.v_model.parameters(), 1.0)
                 nn.utils.clip_grad_norm_(self.v_arch_net.parameters(), 1.0)
 
-                # Step 4: Hessian-vector product for arch_net update
+                # Step 4: Arch_net update
                 dalpha = [v.grad for v in self.v_arch_net.parameters()]
                 dalpha_ = [v.grad.data for v in self.v_arch_net.parameters()]
                 vector = [v.grad.data for v in self.v_model.parameters()]
 
-                implicit_grads = _hessian_vector_product(
-                    vector, dalpha_, self.model, self.arch_net,
-                    self.multi_scale_ppr, self.data,
-                    train_edge, train_edge_neg)
+                if self.first_order:
+                    # First-order DARTS: skip HVP, use val grads directly
+                    pass
+                else:
+                    implicit_grads = _hessian_vector_product(
+                        vector, dalpha_, self.model, self.arch_net,
+                        self.multi_scale_ppr, self.data,
+                        train_edge, train_edge_neg)
 
-                for g, ig in zip(dalpha, implicit_grads):
-                    g.data.sub_(ig.data, alpha=lr_current)
+                    for g, ig in zip(dalpha, implicit_grads):
+                        g.data.sub_(ig.data, alpha=lr_current)
 
                 # Apply gradients to arch_net
                 i = 0
@@ -259,7 +294,30 @@ class ArchitectureSearcher:
             avg_loss = epoch_loss / max(steps, 1)
             history['search_loss'].append(avg_loss)
 
-            # Periodic validation and config distribution tracking
+            # Diagnostics: temperature, embedding norms
+            history['temperature'].append(temp)
+            with torch.no_grad():
+                h_diag = self.model(self.data.x, self.data.edge_index)
+                h_norms = h_diag.norm(dim=-1)
+                history['embedding_norm_mean'].append(h_norms.mean().item())
+                history['embedding_norm_max'].append(h_norms.max().item())
+
+            # Diagnostics: arch entropy on a sample of training edges
+            arch_entropy, mass_top1 = self._compute_arch_diagnostics(
+                pos_train_source, pos_train_target, batch_size)
+            history['arch_entropy'].append(arch_entropy)
+            history['softmax_mass_top1'].append(mass_top1)
+
+            # Periodic config distribution snapshots
+            snapshot_epochs = {0, epochs // 3, 2 * epochs // 3, epochs - 1}
+            if epoch in snapshot_epochs:
+                _, counts = self.get_edge_configs('train', batch_size=4096)
+                history['config_distributions'].append({
+                    'epoch': epoch,
+                    'train_counts': counts.tolist(),
+                })
+
+            # End-of-epoch validation
             val_loss = self._evaluate_val_loss(batch_size)
             history['val_loss'].append(val_loss)
 
@@ -280,8 +338,13 @@ class ArchitectureSearcher:
                     'loss': f'{avg_loss:.4f}',
                     'val': f'{val_loss:.4f}',
                     'best': f'{best_val_loss:.4f}',
+                    'tau': f'{temp:.3f}',
+                    'ent': f'{arch_entropy:.2f}',
                     'wait': f'{cnt_wait}/{patience}',
                 })
+
+            # Scheduler at END of epoch (Fix C)
+            scheduler.step()
 
             if cnt_wait >= patience:
                 if verbose:
@@ -300,6 +363,29 @@ class ArchitectureSearcher:
         return history
 
     @torch.no_grad()
+    def _compute_arch_diagnostics(self, train_source, train_target,
+                                  batch_size, sample_size=4096):
+        """Compute mean arch entropy and top-1 softmax mass on a training sample."""
+        self.model.eval()
+        self.arch_net.train()  # soft weights for entropy measurement
+
+        n = train_source.size(0)
+        sample_n = min(sample_size, n)
+        idx = torch.randperm(n)[:sample_n]
+        src = train_source[idx]
+        dst = train_target[idx]
+
+        h = self.model(self.data.x, self.data.edge_index)
+        cross = self.multi_scale_ppr.get_ppr_cross_pair_batch(src, dst, h)
+        atten = self.arch_net(cross)  # [sample_n, C] soft weights
+
+        entropy = -(atten * (atten + 1e-15).log()).sum(dim=-1).mean().item()
+        top1_mass = atten.max(dim=-1).values.mean().item()
+
+        self.model.train()
+        return entropy, top1_mass
+
+    @torch.no_grad()
     def _evaluate_val_loss(self, batch_size):
         """Compute validation loss with current model + arch_net."""
         self.model.eval()
@@ -309,16 +395,17 @@ class ArchitectureSearcher:
         val_dst = self.split_edge['valid']['target_node'].to(self.device)
         num_val = val_src.size(0)
 
+        # Compute h ONCE (model is frozen during eval)
+        h = self.model(self.data.x, self.data.edge_index)
+
         total_loss = 0.0
         count = 0
         for perm in DataLoader(range(num_val), batch_size, shuffle=False):
             src = val_src[perm]
             dst = val_dst[perm]
             edge = torch.stack([src, dst], dim=0)
-            edge_neg = _generate_neg_edges(
-                self.split_edge, self.data.num_nodes, self.device, len(perm))
+            edge_neg = self._generate_neg_edges(len(perm))
 
-            h = self.model(self.data.x, self.data.edge_index)
             loss = self.model.compute_loss(
                 h, self.arch_net, self.multi_scale_ppr, edge, edge_neg)
             total_loss += loss.item() * len(perm)
@@ -353,10 +440,8 @@ class ArchitectureSearcher:
             all_indices.append(indices.cpu())
 
         config_indices = torch.cat(all_indices)
-        config_counts = torch.zeros(self.multi_scale_ppr.num_configs,
-                                    dtype=torch.long)
-        for idx in config_indices:
-            config_counts[idx] += 1
+        config_counts = torch.bincount(
+            config_indices, minlength=self.multi_scale_ppr.num_configs)
 
         return config_indices, config_counts
 

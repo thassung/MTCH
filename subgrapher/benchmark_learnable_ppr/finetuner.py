@@ -394,9 +394,6 @@ def train_epoch_finetune(encoder, predictor, data, cache, optimizer,
             total_loss += accum_loss
             total_examples += accum_examples
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     return total_loss / max(total_examples, 1)
 
 

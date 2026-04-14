@@ -41,7 +41,10 @@ DEFAULT_CONFIG = {
     'search_patience': 50,
     'arch_hidden': 256,
     'arch_layers': 3,
-    'temperature': 0.07,
+    'temperature_start': 1.0,
+    'temperature_end': 0.07,
+    'edges_per_search_epoch': None,
+    'first_order': False,
     # Phase 2: Fine-tuning
     'finetune_epochs': 200,
     'finetune_batch_size': 8192,
@@ -136,7 +139,7 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         in_channels=config['hidden_channels'],
         hidden_channels=config['arch_hidden'],
         num_layers=config['arch_layers'],
-        temperature=config['temperature'],
+        temperature=config.get('temperature_start', 1.0),
     )
 
     num_params_search = (sum(p.numel() for p in model.parameters()) +
@@ -149,6 +152,10 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         lr=config['search_lr'],
         lr_arch=config['search_lr_arch'],
         lr_min=config['search_lr_min'],
+        temperature_start=config.get('temperature_start', 1.0),
+        temperature_end=config.get('temperature_end', 0.07),
+        edges_per_search_epoch=config.get('edges_per_search_epoch'),
+        first_order=config.get('first_order', False),
     )
 
     search_history = searcher.search(
@@ -303,7 +310,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
             'search_batch_size': config['search_batch_size'],
             'search_lr': config['search_lr'],
             'search_patience': config['search_patience'],
-            'temperature': config['temperature'],
+            'temperature_start': config.get('temperature_start', 1.0),
+            'temperature_end': config.get('temperature_end', 0.07),
             'finetune_epochs': config['finetune_epochs'],
             'finetune_batch_size': config['finetune_batch_size'],
             'finetune_lr': config['finetune_lr'],
@@ -452,7 +460,14 @@ def main():
                         help='Disable tqdm bar for dataset×encoder runs')
     parser.add_argument('--no_run_artifacts', action='store_true',
                         help='Skip results/.../runs/<id>/ JSON + checkpoints + config .pt')
-    parser.add_argument('--temperature', type=float, default=0.07)
+    parser.add_argument('--temperature_start', type=float, default=1.0,
+                        help='Starting softmax temperature (annealing)')
+    parser.add_argument('--temperature_end', type=float, default=0.07,
+                        help='Ending softmax temperature (annealing)')
+    parser.add_argument('--edges_per_search_epoch', type=int, default=0,
+                        help='Subsample training edges per search epoch; 0 = all')
+    parser.add_argument('--first_order', action='store_true',
+                        help='Use first-order DARTS (skip HVP)')
 
     args = parser.parse_args()
 
@@ -482,7 +497,10 @@ def main():
         'use_checkpoint_cache': not args.no_checkpoint_cache,
         'progress_experiments': not args.no_run_progress,
         'save_run_artifacts': not args.no_run_artifacts,
-        'temperature': args.temperature,
+        'temperature_start': args.temperature_start,
+        'temperature_end': args.temperature_end,
+        'edges_per_search_epoch': args.edges_per_search_epoch if args.edges_per_search_epoch > 0 else None,
+        'first_order': args.first_order,
     })
 
     tqdm.write(f'Device: {device}')

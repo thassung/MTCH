@@ -18,10 +18,12 @@ class MultiScalePPR:
         data: PyG Data object (needed if creating new preprocessors)
         teleport_values: List of teleport probabilities to use
         preprocessed_dir: Directory containing preprocessed PPR files
+        device: If set, keep dense PPR matrices on this device (e.g. 'cuda').
+                If None, keep on CPU with pinned memory for async transfer.
     """
 
     def __init__(self, dataset_name, data=None, teleport_values=None,
-                 preprocessed_dir='preprocessed'):
+                 preprocessed_dir='preprocessed', device=None):
         if teleport_values is None:
             teleport_values = [0.50, 0.85, 0.95]
         self.teleport_values = sorted(teleport_values)
@@ -38,6 +40,8 @@ class MultiScalePPR:
         for si in self.teleport_values:
             for sj in self.teleport_values:
                 self.config_labels.append((si, sj))
+
+        self._build_dense(device)
 
     def _load_all(self, dataset_name, data, preprocessed_dir):
         """Load preprocessors for each teleport value."""
@@ -60,6 +64,24 @@ class MultiScalePPR:
                     f"PPR file not found: {path}. "
                     f"Run preprocessing first or pass data= to compute on the fly."
                 )
+
+    def _build_dense(self, device):
+        """Pre-stack all PPR vectors into dense [N, N] tensors for O(1) batch lookup."""
+        self.ppr_dense = {}
+        N = self.num_nodes
+        print(f"  Building dense PPR matrices ({N}x{N} x {self.num_scales} scales)...")
+        for alpha in self.teleport_values:
+            pp = self.preprocessors[alpha]
+            mat = torch.stack([pp.get_ppr(i) for i in range(N)])  # [N, N]
+            if device is not None:
+                self.ppr_dense[alpha] = mat.to(device)
+            elif torch.cuda.is_available():
+                self.ppr_dense[alpha] = mat.pin_memory()
+            else:
+                self.ppr_dense[alpha] = mat
+        dense_mb = N * N * 4 * self.num_scales / (1024 * 1024)
+        placement = str(device) if device else ('pinned CPU' if torch.cuda.is_available() else 'CPU')
+        print(f"  Dense PPR ready: {dense_mb:.0f} MB on {placement}")
 
     def get_ppr(self, node, teleport):
         """Get PPR vector for a node at a specific teleport value."""
@@ -96,6 +118,9 @@ class MultiScalePPR:
         """
         Batched cross-pair computation for multiple edges.
 
+        Uses pre-built dense [N,N] matrices for O(1) tensor indexing
+        instead of Python-loop dictionary lookups.
+
         Args:
             sources: Tensor of source node indices [B]
             targets: Tensor of target node indices [B]
@@ -111,16 +136,14 @@ class MultiScalePPR:
         ppr_u_all = {}
         ppr_v_all = {}
         for si in self.teleport_values:
-            ppr_u_stack = torch.stack([
-                self.get_ppr(s.item(), si) for s in sources
-            ]).to(device)  # [B, N]
-            ppr_u_all[si] = ppr_u_stack @ H  # [B, D]
+            mat = self.ppr_dense[si]
+            idx = sources if mat.device == sources.device else sources.cpu()
+            ppr_u_all[si] = mat[idx].to(device, non_blocking=True) @ H  # [B, D]
 
         for sj in self.teleport_values:
-            ppr_v_stack = torch.stack([
-                self.get_ppr(t.item(), sj) for t in targets
-            ]).to(device)  # [B, N]
-            ppr_v_all[sj] = ppr_v_stack @ H  # [B, D]
+            mat = self.ppr_dense[sj]
+            idx = targets if mat.device == targets.device else targets.cpu()
+            ppr_v_all[sj] = mat[idx].to(device, non_blocking=True) @ H  # [B, D]
 
         cross_pairs = torch.zeros(B, self.num_configs, D, device=device)
         idx = 0
@@ -141,16 +164,19 @@ class MultiScalePPR:
                            for p in self.preprocessors.values())
         total_mb = sum(p.get_stats()['memory_mb']
                        for p in self.preprocessors.values())
+        N = self.num_nodes
+        dense_mb = N * N * 4 * self.num_scales / (1024 * 1024)
         return {
             'num_scales': self.num_scales,
             'num_configs': self.num_configs,
             'teleport_values': self.teleport_values,
             'total_cached_vectors': total_cached,
             'total_memory_mb': total_mb,
+            'dense_memory_mb': dense_mb,
         }
 
     def __repr__(self):
         stats = self.get_stats()
         return (f"MultiScalePPR(scales={self.teleport_values}, "
                 f"configs={self.num_configs}, "
-                f"memory={stats['total_memory_mb']:.1f}MB)")
+                f"dense={stats['dense_memory_mb']:.0f}MB)")

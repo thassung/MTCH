@@ -30,7 +30,7 @@ code(
 "TOP_K = 100                              # Subgraph size for Phase 2\n"
 "\n"
 "DATASETS = ['FB15K237']                  # FB15K237, WN18RR, NELL-995\n"
-"ENCODERS = ['SAGE']                      # GCN, SAGE, GAT\n"
+"ENCODERS = ['GCN', 'SAGE', 'GAT']       # All 3 encoders per run\n"
 "\n"
 "# Hyperparameters\n"
 "FEATURE_DIM = 128\n"
@@ -43,7 +43,10 @@ code(
 "SEARCH_BATCH_SIZE = 1024\n"
 "SEARCH_LR = 0.01\n"
 "SEARCH_PATIENCE = 50\n"
-"TEMPERATURE = 0.07\n"
+"TEMPERATURE_START = 1.0                  # Annealing: start (soft exploration)\n"
+"TEMPERATURE_END = 0.07                   # Annealing: end (sharp selection)\n"
+"EDGES_PER_SEARCH_EPOCH = None            # Subsample search edges (None = all)\n"
+"FIRST_ORDER = False                      # Skip HVP (first-order DARTS)\n"
 "\n"
 "# Phase 2: Fine-tuning\n"
 "FINETUNE_EPOCHS = 200\n"
@@ -56,7 +59,9 @@ code(
 "import torch\n"
 "DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
 "print(f'Device: {DEVICE}')\n"
-"print(f'Search space: {len(TELEPORT_VALUES)}x{len(TELEPORT_VALUES)} = {len(TELEPORT_VALUES)**2} configs')"
+"print(f'Search space: {len(TELEPORT_VALUES)}x{len(TELEPORT_VALUES)} = {len(TELEPORT_VALUES)**2} configs')\n"
+"print(f'Encoders: {ENCODERS}')\n"
+"print(f'Temperature annealing: {TEMPERATURE_START} -> {TEMPERATURE_END}')"
 )
 
 code(
@@ -137,11 +142,15 @@ code(
 "\n"
 "        arch_net = PPRSearchNet(\n"
 "            in_channels=HIDDEN_CHANNELS, hidden_channels=256,\n"
-"            num_layers=3, temperature=TEMPERATURE)\n"
+"            num_layers=3, temperature=TEMPERATURE_START)\n"
 "\n"
 "        searcher = ArchitectureSearcher(\n"
 "            model, arch_net, msp, data, split_edge,\n"
-"            device=DEVICE, lr=SEARCH_LR, lr_arch=SEARCH_LR)\n"
+"            device=DEVICE, lr=SEARCH_LR, lr_arch=SEARCH_LR,\n"
+"            temperature_start=TEMPERATURE_START,\n"
+"            temperature_end=TEMPERATURE_END,\n"
+"            edges_per_search_epoch=EDGES_PER_SEARCH_EPOCH,\n"
+"            first_order=FIRST_ORDER)\n"
 "\n"
 "        search_history = searcher.search(\n"
 "            epochs=SEARCH_EPOCHS, batch_size=SEARCH_BATCH_SIZE,\n"
@@ -227,6 +236,68 @@ code(
 "        plt.tight_layout(); plt.show()"
 )
 
+md("## 4a. Temperature + Entropy Diagnostics")
+
+code(
+"for dataset_name in DATASETS:\n"
+"    r = all_results[dataset_name]\n"
+"    for enc_type in ENCODERS:\n"
+"        hist = r['experiments'][enc_type]['search_history']\n"
+"        if not hist.get('temperature'): continue\n"
+"\n"
+"        fig, ax1 = plt.subplots(figsize=(10, 5))\n"
+"        epochs_list = range(1, len(hist['temperature']) + 1)\n"
+"\n"
+"        color_t = 'tab:blue'\n"
+"        ax1.set_xlabel('Epoch')\n"
+"        ax1.set_ylabel('Temperature', color=color_t)\n"
+"        ax1.plot(list(epochs_list), hist['temperature'], color=color_t, label='Temperature')\n"
+"        ax1.tick_params(axis='y', labelcolor=color_t)\n"
+"\n"
+"        ax2 = ax1.twinx()\n"
+"        color_e = 'tab:orange'\n"
+"        ax2.set_ylabel('Arch Entropy', color=color_e)\n"
+"        ax2.plot(list(epochs_list), hist['arch_entropy'], color=color_e, label='Entropy')\n"
+"        if hist.get('softmax_mass_top1'):\n"
+"            ax2.plot(list(epochs_list), hist['softmax_mass_top1'],\n"
+"                     color='tab:green', linestyle='--', label='Top-1 mass')\n"
+"        ax2.tick_params(axis='y', labelcolor=color_e)\n"
+"\n"
+"        lines1, labels1 = ax1.get_legend_handles_labels()\n"
+"        lines2, labels2 = ax2.get_legend_handles_labels()\n"
+"        ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')\n"
+"\n"
+"        fig.suptitle(f'{dataset_name} / {enc_type} -- Temperature Annealing + Entropy',\n"
+"                     fontsize=14, fontweight='bold')\n"
+"        plt.tight_layout(); plt.show()"
+)
+
+md("## 4b. Embedding Norm Distribution")
+
+code(
+"for dataset_name in DATASETS:\n"
+"    r = all_results[dataset_name]\n"
+"    has_data = any(r['experiments'].get(e, {}).get('search_history', {}).get('embedding_norm_mean')\n"
+"                   for e in ENCODERS)\n"
+"    if not has_data: continue\n"
+"\n"
+"    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))\n"
+"    for enc_type in ENCODERS:\n"
+"        hist = r['experiments'][enc_type]['search_history']\n"
+"        if not hist.get('embedding_norm_mean'): continue\n"
+"        epochs_list = range(1, len(hist['embedding_norm_mean']) + 1)\n"
+"        ax1.plot(list(epochs_list), hist['embedding_norm_mean'], label=enc_type)\n"
+"        ax2.plot(list(epochs_list), hist['embedding_norm_max'], label=enc_type)\n"
+"\n"
+"    ax1.set_xlabel('Epoch'); ax1.set_ylabel('Mean ||h||')\n"
+"    ax1.set_title('Mean Embedding Norm'); ax1.legend()\n"
+"    ax2.set_xlabel('Epoch'); ax2.set_ylabel('Max ||h||')\n"
+"    ax2.set_title('Max Embedding Norm'); ax2.legend()\n"
+"    fig.suptitle(f'{dataset_name} -- Embedding Norms (after L2 norm)',\n"
+"                 fontsize=14, fontweight='bold')\n"
+"    plt.tight_layout(); plt.show()"
+)
+
 md("## 5. Phase 2: Fine-tune on Extracted Subgraphs")
 
 md("### 5a. Build / load subgraph caches (one-time cost, saved to disk)")
@@ -303,7 +374,7 @@ code(
 "        print_evaluation_results(test_results, 'test')"
 )
 
-md("## 7. Fine-Tuning Training Curves")
+md("## 7. Fine-Tuning Training Curves (MRR + full val metrics)")
 
 code(
 "for dataset_name in DATASETS:\n"
@@ -313,25 +384,35 @@ code(
 "        hist = exp.get('ft_history', {})\n"
 "        if not hist: continue\n"
 "\n"
-"        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))\n"
+"        fig, axes = plt.subplots(1, 3, figsize=(18, 5))\n"
 "        epochs_list = range(1, len(hist['train_loss']) + 1)\n"
-"        sns.lineplot(x=list(epochs_list), y=hist['train_loss'], ax=ax1, label='Train Loss')\n"
-"        ax1.set_xlabel('Epoch'); ax1.set_ylabel('Loss'); ax1.set_title('Phase 2: Fine-tune Loss')\n"
+"        sns.lineplot(x=list(epochs_list), y=hist['train_loss'], ax=axes[0], label='Train Loss')\n"
+"        axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')\n"
+"        axes[0].set_title('Phase 2: Fine-tune Loss')\n"
 "\n"
 "        if hist['val_results']:\n"
 "            val_mrrs = [vr['mrr'] for vr in hist['val_results']]\n"
 "            eval_epochs = list(range(5, 5 * len(val_mrrs) + 1, 5))\n"
-"            sns.lineplot(x=eval_epochs, y=val_mrrs, ax=ax2, marker='o')\n"
-"            ax2.axhline(hist['best_val_mrr'], color='red', linestyle='--', alpha=0.5,\n"
-"                        label=f'Best: {hist[\"best_val_mrr\"]:.4f}')\n"
-"        ax2.set_xlabel('Epoch'); ax2.set_ylabel('MRR'); ax2.set_title('Validation MRR')\n"
-"        ax2.legend()\n"
+"            sns.lineplot(x=eval_epochs, y=val_mrrs, ax=axes[1], marker='o', label='MRR')\n"
+"            axes[1].axhline(hist['best_val_mrr'], color='red', linestyle='--', alpha=0.5,\n"
+"                            label=f'Best: {hist[\"best_val_mrr\"]:.4f}')\n"
+"            axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('MRR')\n"
+"            axes[1].set_title('Validation MRR'); axes[1].legend()\n"
+"\n"
+"            val_aucs = [vr.get('auc', 0) for vr in hist['val_results']]\n"
+"            val_aps = [vr.get('ap', 0) for vr in hist['val_results']]\n"
+"            if any(val_aucs):\n"
+"                sns.lineplot(x=eval_epochs, y=val_aucs, ax=axes[2], label='AUC')\n"
+"            if any(val_aps):\n"
+"                sns.lineplot(x=eval_epochs, y=val_aps, ax=axes[2], label='AP')\n"
+"            axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('Score')\n"
+"            axes[2].set_title('Val AUC / AP'); axes[2].legend()\n"
 "\n"
 "        fig.suptitle(f'{dataset_name} / {enc_type} -- Fine-tuning', fontsize=14, fontweight='bold')\n"
 "        plt.tight_layout(); plt.show()"
 )
 
-md("## 8. Comparison with Static PPR Baselines")
+md("## 8. Cross-Encoder Comparison + Static PPR Baselines")
 
 code(
 "def load_baseline_results():\n"
@@ -370,14 +451,36 @@ code(
 "if rows:\n"
 "    df = pd.DataFrame(rows)\n"
 "    for metric in ['MRR', 'AUC']:\n"
-"        fig, ax = plt.subplots(figsize=(max(8, 2 * len(rows)), 5))\n"
+"        fig, ax = plt.subplots(figsize=(max(10, 2.5 * len(ENCODERS)), 5))\n"
 "        sns.barplot(data=df, x='Encoder', y=metric, hue='Method', ax=ax)\n"
-"        ax.set_title(f'Test {metric} Comparison')\n"
+"        ax.set_title(f'Test {metric} -- Cross-Encoder Comparison')\n"
 "        ax.legend(loc='lower right')\n"
 "        plt.tight_layout(); plt.show()\n"
 "    display(df.pivot_table(index=['Dataset', 'Encoder'], columns='Method', values=['MRR', 'AUC']))\n"
 "else:\n"
-"    print('No baseline results found. Run the static PPR benchmark first.')"
+"    print('No results to compare yet.')"
+)
+
+md("### 8a. Phase 1 Wall-Clock per Encoder")
+
+code(
+"for dataset_name in DATASETS:\n"
+"    r = all_results[dataset_name]\n"
+"    enc_names = []; search_times = []\n"
+"    for enc_type in ENCODERS:\n"
+"        exp = r['experiments'].get(enc_type)\n"
+"        if exp:\n"
+"            enc_names.append(enc_type)\n"
+"            search_times.append(exp['search_history']['total_time'])\n"
+"\n"
+"    if enc_names:\n"
+"        fig, ax = plt.subplots(figsize=(8, 4))\n"
+"        ax.barh(enc_names, [t / 60 for t in search_times])\n"
+"        ax.set_xlabel('Phase 1 Time (minutes)')\n"
+"        ax.set_title(f'{dataset_name} -- Search Time by Encoder')\n"
+"        for i, t in enumerate(search_times):\n"
+"            ax.text(t / 60 + 0.5, i, f'{t:.0f}s', va='center')\n"
+"        plt.tight_layout(); plt.show()"
 )
 
 md("## 9. Per-Edge Config Analysis by Node Degree")
@@ -526,12 +629,15 @@ code(
 "            'test_results': {k: float(v) for k, v in tr.items()},\n"
 "            'config_distribution': {\n"
 "                'train': exp['train_counts'].tolist(),\n"
+"                'val': exp['val_counts'].tolist(),\n"
 "                'test': exp['test_counts'].tolist(),\n"
 "                'labels': [f'({tu},{tv})' for tu, tv in msp.config_labels],\n"
 "            },\n"
 "            'search_time': exp['search_history']['total_time'],\n"
 "            'finetune_best_mrr': exp['ft_history']['best_val_mrr'],\n"
 "            'finetune_best_epoch': exp['ft_history']['best_epoch'],\n"
+"            'temperature_start': TEMPERATURE_START,\n"
+"            'temperature_end': TEMPERATURE_END,\n"
 "        }\n"
 "        with open(os.path.join(save_dir, 'full_results.json'), 'w') as f:\n"
 "            json.dump(result_json, f, indent=2)\n"
@@ -549,7 +655,8 @@ code(
 "            'search_batch_size': SEARCH_BATCH_SIZE,\n"
 "            'search_lr': SEARCH_LR,\n"
 "            'search_patience': SEARCH_PATIENCE,\n"
-"            'temperature': TEMPERATURE,\n"
+"            'temperature_start': TEMPERATURE_START,\n"
+"            'temperature_end': TEMPERATURE_END,\n"
 "            'finetune_epochs': FINETUNE_EPOCHS,\n"
 "            'finetune_batch_size': FINETUNE_BATCH_SIZE,\n"
 "            'finetune_lr': FINETUNE_LR,\n"

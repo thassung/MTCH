@@ -22,11 +22,12 @@ class PPRSearchNet(nn.Module):
         hidden_channels: Hidden dimension of the scoring MLP
         num_layers: Number of MLP layers
         cat_type: 'multi' or 'concat' (matches AutoLinkPPR)
-        temperature: Softmax temperature (lower = sharper)
+        temperature: Initial softmax temperature (lower = sharper).
+                     Updated externally via set_temperature() during annealing.
     """
 
     def __init__(self, in_channels, hidden_channels=256, num_layers=3,
-                 cat_type='multi', temperature=0.07):
+                 cat_type='multi', temperature=1.0):
         super().__init__()
 
         self.temperature = temperature
@@ -47,6 +48,10 @@ class PPRSearchNet(nn.Module):
                 self.trans.append(nn.Linear(hidden_channels, hidden_channels,
                                             bias=False))
         self.trans.append(nn.Linear(hidden_channels, 1, bias=False))
+
+    def set_temperature(self, temperature):
+        """Update the softmax temperature (used by ArchitectureSearcher for annealing)."""
+        self.temperature = temperature
 
     def reset_parameters(self):
         for layer in self.trans:

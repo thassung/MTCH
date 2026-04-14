@@ -69,8 +69,10 @@ class AutoLinkPPR(nn.Module):
             lin.reset_parameters()
 
     def forward(self, x, edge_index):
-        """Run GNN encoder on full graph -> node embeddings [N, D]."""
-        return self.encoder(x, edge_index)
+        """Run GNN encoder on full graph -> L2-normalized node embeddings [N, D]."""
+        h = self.encoder(x, edge_index)
+        h = F.normalize(h, dim=-1)
+        return h
 
     def pred_pair(self, x):
         """MLP link predictor on combined representation."""
