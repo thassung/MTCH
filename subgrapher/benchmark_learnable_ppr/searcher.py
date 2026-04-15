@@ -199,7 +199,8 @@ class ArchitectureSearcher:
         best_val_loss = float('inf')
         start_time = time.time()
 
-        iterator = tqdm(range(epochs), desc='Arch Search') if verbose else range(epochs)
+        iterator = tqdm(range(epochs), desc='Arch Search',
+                        mininterval=10, maxinterval=60) if verbose else range(epochs)
 
         for epoch in iterator:
             temp = self._get_temperature(epoch, epochs)
@@ -237,6 +238,9 @@ class ArchitectureSearcher:
                         h, self.v_arch_net, self.multi_scale_ppr,
                         train_edge, train_edge_neg)
 
+                if torch.isnan(loss_inner) or torch.isinf(loss_inner):
+                    continue
+
                 loss_inner.backward()
                 nn.utils.clip_grad_norm_(self.v_model.parameters(), 1.0)
                 nn.utils.clip_grad_norm_(self.v_arch_net.parameters(), 1.0)
@@ -255,6 +259,9 @@ class ArchitectureSearcher:
                     loss_val = self.v_model.compute_loss(
                         h_v, self.v_arch_net, self.multi_scale_ppr,
                         valid_edge, valid_edge_neg)
+
+                if torch.isnan(loss_val) or torch.isinf(loss_val):
+                    continue
 
                 loss_val.backward()
                 nn.utils.clip_grad_norm_(self.v_model.parameters(), 1.0)
@@ -295,6 +302,11 @@ class ArchitectureSearcher:
                     loss_model = self.model.compute_loss(
                         h, self.arch_net, self.multi_scale_ppr,
                         train_edge, train_edge_neg)
+
+                if torch.isnan(loss_model) or torch.isinf(loss_model):
+                    self.optimizer.zero_grad()
+                    scaler.update()
+                    continue
 
                 scaler.scale(loss_model).backward()
                 scaler.unscale_(self.optimizer)

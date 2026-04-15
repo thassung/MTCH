@@ -33,4 +33,5 @@ __all__ = [
     'PPRSearchNet',
     'run_learnable_ppr_benchmark',
     'resolve_alpha_weights',
+    'evaluate_learnable_ppr_fullgraph',
 ]

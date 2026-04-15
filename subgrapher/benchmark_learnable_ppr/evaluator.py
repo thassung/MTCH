@@ -1,8 +1,13 @@
 """
 Evaluation for learnable PPR subgraph link prediction.
-Uses per-edge learned configurations for subgraph extraction during eval.
 
-Supports optional SubgraphCache for fast repeated evaluation.
+Two evaluation modes:
+  - **subgraph**: per-edge subgraph encoding (fast, used during training).
+    Out-of-subgraph negatives receive a fixed low score, which inflates MRR.
+  - **fullgraph**: full-graph encoding with all negatives scored by the model.
+    This is the gold-standard for comparing against baselines.
+
+Use ``evaluate_learnable_ppr_fullgraph`` for any reported / saved metrics.
 """
 
 import torch
@@ -11,6 +16,84 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import subgraph
+
+
+# ---------------------------------------------------------------------------
+# Full-graph evaluation (fair, comparable to benchmark/evaluator.py)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_learnable_ppr_fullgraph(encoder, predictor, data, split_edge,
+                                      split='test', batch_size=4096,
+                                      device='cpu',
+                                      K_values=None):
+    """Evaluate using full-graph encoding — identical methodology to benchmarks.
+
+    The fine-tuned encoder+predictor are applied to the **full graph**, and
+    every negative is scored by the model (no 0.1 fallback).  This makes
+    results directly comparable to Full Graph / Static PPR / k-hop baselines.
+
+    Args:
+        encoder: Fine-tuned GNN encoder
+        predictor: Fine-tuned LinkPredictor
+        data: PyG Data (full graph with features)
+        split_edge: Edge split dictionary
+        split: 'valid' or 'test'
+        batch_size: Evaluation chunk size
+        device: Device
+        K_values: Hit@K values to compute
+
+    Returns:
+        Dictionary with MRR, AUC, AP, Hits@K
+    """
+    if K_values is None:
+        K_values = [1, 3, 10, 50, 100]
+
+    encoder.eval()
+    predictor.eval()
+
+    h = encoder(data.x.to(device), data.edge_index.to(device))
+
+    source = split_edge[split]['source_node']
+    target = split_edge[split]['target_node']
+    target_neg = split_edge[split]['target_node_neg']
+
+    num_pos = source.size(0)
+    num_neg_per_pos = target_neg.size(1)
+
+    eval_bs = min(batch_size, 4096)
+
+    pos_preds = []
+    neg_preds = []
+
+    for perm in DataLoader(torch.arange(num_pos), eval_bs):
+        src = source[perm].to(device)
+        dst = target[perm].to(device)
+        pos_preds.append(predictor(h[src], h[dst]).squeeze().cpu())
+
+        dst_neg_chunk = target_neg[perm].to(device)
+        src_rep = src.unsqueeze(1).expand_as(dst_neg_chunk).reshape(-1)
+        dst_neg_flat = dst_neg_chunk.reshape(-1)
+
+        chunk_neg = []
+        for neg_start in range(0, src_rep.size(0), eval_bs):
+            neg_end = min(neg_start + eval_bs, src_rep.size(0))
+            chunk_neg.append(
+                predictor(h[src_rep[neg_start:neg_end]],
+                          h[dst_neg_flat[neg_start:neg_end]]).squeeze().cpu())
+        neg_preds.append(torch.cat(chunk_neg).view(len(perm), num_neg_per_pos))
+
+        del src, dst, dst_neg_chunk, src_rep, dst_neg_flat, chunk_neg
+
+    pos_pred = torch.cat(pos_preds, dim=0)
+    neg_pred = torch.cat(neg_preds, dim=0)
+
+    return _compute_all_metrics(pos_pred, neg_pred, K_values)
+
+
+# ---------------------------------------------------------------------------
+# Subgraph evaluation (used during fine-tuning for speed)
+# ---------------------------------------------------------------------------
 @torch.no_grad()
 def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
                             multi_scale_ppr, config_indices,

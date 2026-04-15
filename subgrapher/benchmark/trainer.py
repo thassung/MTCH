@@ -148,7 +148,8 @@ def train_model(encoder, predictor, data, split_edge,
     
     # Training loop
     start_time = time.time()
-    iterator = tqdm(range(1, epochs + 1), desc='Training') if verbose else range(1, epochs + 1)
+    iterator = tqdm(range(1, epochs + 1), desc='Training',
+                    mininterval=10, maxinterval=60) if verbose else range(1, epochs + 1)
     
     for epoch in iterator:
         epoch_start = time.time()

@@ -509,7 +509,8 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
     iterator = range(start_epoch, epochs + 1)
     if verbose:
         iterator = tqdm(iterator, desc='Fine-tuning',
-                        initial=start_epoch - 1, total=epochs)
+                        initial=start_epoch - 1, total=epochs,
+                        mininterval=10, maxinterval=60)
 
     for epoch in iterator:
         show_batch = (epoch <= start_epoch + 2) if verbose else False
