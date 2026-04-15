@@ -23,7 +23,7 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
     
     with torch.amp.autocast('cuda', enabled=use_amp):
         h = encoder(data.x.to(device), data.edge_index.to(device))
-    h = h.detach()
+    h = h.detach().float()
     
     source = split_edge[split]['source_node']
     target = split_edge[split]['target_node']
