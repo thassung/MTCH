@@ -13,9 +13,9 @@ from .evaluator import evaluate_link_prediction, print_evaluation_results
 
 
 def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, device,
-                grad_clip=None, scaler=None):
+                grad_clip=None):
     """
-    Train for one epoch with gradient clipping and optional AMP.
+    Train for one epoch with gradient clipping.
     Each mini-batch does one GNN forward + edge loss + backward.
     """
     encoder.train()
@@ -26,43 +26,31 @@ def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, dev
 
     total_loss = 0
     total_examples = 0
-    use_amp = scaler is not None
 
     for perm in DataLoader(torch.arange(source_edge.size(0)), batch_size, shuffle=True):
         optimizer.zero_grad()
 
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            h = encoder(data.x, data.edge_index)
+        h = encoder(data.x, data.edge_index)
 
-            src = source_edge[perm].to(device)
-            dst = target_edge[perm].to(device)
+        src = source_edge[perm].to(device)
+        dst = target_edge[perm].to(device)
 
-            pos_out = predictor(h[src], h[dst])
-            pos_loss = -torch.log(pos_out + 1e-15).mean()
+        pos_out = predictor(h[src], h[dst])
+        pos_loss = -torch.log(pos_out + 1e-15).mean()
 
-            dst_neg = torch.randint(0, data.num_nodes, src.size(),
-                                   dtype=torch.long, device=device)
-            neg_out = predictor(h[src], h[dst_neg])
-            neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
+        dst_neg = torch.randint(0, data.num_nodes, src.size(),
+                               dtype=torch.long, device=device)
+        neg_out = predictor(h[src], h[dst_neg])
+        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
 
-            loss = pos_loss + neg_loss
+        loss = pos_loss + neg_loss
+        loss.backward()
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            if grad_clip is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    list(encoder.parameters()) + list(predictor.parameters()),
-                    grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    list(encoder.parameters()) + list(predictor.parameters()),
-                    grad_clip)
-            optimizer.step()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(predictor.parameters()),
+                grad_clip)
+        optimizer.step()
 
         num_examples = pos_out.size(0)
         total_loss += loss.item() * num_examples
@@ -86,9 +74,6 @@ def train_model(encoder, predictor, data, split_edge,
     predictor = predictor.to(device)
     data.x = data.x.to(device)
     data.edge_index = data.edge_index.to(device)
-
-    use_amp = (device != 'cpu' and torch.cuda.is_available())
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(predictor.parameters()),
@@ -134,7 +119,7 @@ def train_model(encoder, predictor, data, split_edge,
         
         loss = train_epoch(encoder, predictor, data, split_edge, 
                           optimizer, batch_size, device,
-                          grad_clip=grad_clip, scaler=scaler)
+                          grad_clip=grad_clip)
         
         epoch_time = time.time() - epoch_start
         history['train_loss'].append(loss)

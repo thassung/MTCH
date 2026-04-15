@@ -19,11 +19,9 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
     predictor.eval()
     
     device = next(encoder.parameters()).device
-    use_amp = (device.type == 'cuda')
     
-    with torch.amp.autocast('cuda', enabled=use_amp):
-        h = encoder(data.x.to(device), data.edge_index.to(device))
-    h = h.detach().float()
+    h = encoder(data.x.to(device), data.edge_index.to(device))
+    h = h.detach()
     
     source = split_edge[split]['source_node']
     target = split_edge[split]['target_node']
@@ -94,10 +92,12 @@ def compute_mrr(pos_pred, neg_pred):
     Returns:
         MRR score
     """
-    # For each positive edge, count how many negatives score higher
+    if torch.isnan(pos_pred).any() or torch.isnan(neg_pred).any():
+        return 0.0
+
     pos_pred = pos_pred.unsqueeze(1)  # [num_edges, 1]
-    ranks = (neg_pred >= pos_pred).sum(dim=1) + 1  # +1 for the positive edge itself
-    
+    ranks = (neg_pred >= pos_pred).sum(dim=1) + 1
+
     mrr = (1.0 / ranks.float()).mean().item()
     return mrr
 
@@ -106,17 +106,13 @@ def compute_hits_at_k(pos_pred, neg_pred, k):
     """
     Compute Hit@K metric.
     Percentage of positive edges ranked in top-K.
-    
-    Args:
-        pos_pred: Positive predictions [num_edges]
-        neg_pred: Negative predictions [num_edges, num_neg_samples]
-        k: K value
-    Returns:
-        Hit@K score
     """
-    pos_pred = pos_pred.unsqueeze(1)  # [num_edges, 1]
+    if torch.isnan(pos_pred).any() or torch.isnan(neg_pred).any():
+        return 0.0
+
+    pos_pred = pos_pred.unsqueeze(1)
     ranks = (neg_pred >= pos_pred).sum(dim=1) + 1
-    
+
     hits = (ranks <= k).float().mean().item()
     return hits
 
