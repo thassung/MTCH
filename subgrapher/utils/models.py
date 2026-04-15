@@ -17,10 +17,10 @@ class GCN(torch.nn.Module):
         super(GCN, self).__init__()
         
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GCNConv(in_channels, hidden_channels, normalize=False))
+        self.convs.append(GCNConv(in_channels, hidden_channels))
         for _ in range(num_layers - 2):
-            self.convs.append(GCNConv(hidden_channels, hidden_channels, normalize=False))
-        self.convs.append(GCNConv(hidden_channels, out_channels, normalize=False))
+            self.convs.append(GCNConv(hidden_channels, hidden_channels))
+        self.convs.append(GCNConv(hidden_channels, out_channels))
         
         self.dropout = dropout
     

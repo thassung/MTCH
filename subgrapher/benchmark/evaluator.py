@@ -13,26 +13,18 @@ from torch.utils.data import DataLoader
 def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid', 
                               batch_size=65536, K_values=[1, 3, 10, 50, 100]):
     """    
-    Args:
-        encoder: GNN encoder model
-        predictor: Link predictor model
-        data: PyG Data object
-        split_edge: Dictionary with edge splits
-        split: 'valid' or 'test'
-        batch_size: Batch size for evaluation
-        K_values: List of K values for Hit@K metric
-    Returns:
-        Dictionary with all metrics
+    Evaluate link prediction with chunked negative scoring to limit GPU memory.
     """
     encoder.eval()
     predictor.eval()
     
     device = next(encoder.parameters()).device
+    use_amp = (device.type == 'cuda')
     
-    # Encode all nodes once
-    h = encoder(data.x.to(device), data.edge_index.to(device))
+    with torch.amp.autocast('cuda', enabled=use_amp):
+        h = encoder(data.x.to(device), data.edge_index.to(device))
+    h = h.detach()
     
-    # Keep heavy tensors on CPU; only move batch-sized slices to GPU
     source = split_edge[split]['source_node']
     target = split_edge[split]['target_node']
     target_neg = split_edge[split]['target_node_neg']
@@ -40,7 +32,7 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
     num_pos_edges = source.size(0)
     num_neg_per_pos = target_neg.size(1)
     
-    eval_bs = min(batch_size, 4096)
+    eval_bs = min(batch_size, 2048)
     
     pos_preds = []
     neg_preds = []
@@ -50,8 +42,7 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
         dst = target[perm].to(device)
         pos_preds.append(predictor(h[src], h[dst]).squeeze().cpu())
         
-        # Negatives for this chunk only (never all at once)
-        dst_neg_chunk = target_neg[perm].to(device)          # [chunk, neg_per_pos]
+        dst_neg_chunk = target_neg[perm].to(device)
         src_rep = src.unsqueeze(1).expand_as(dst_neg_chunk).reshape(-1)
         dst_neg_flat = dst_neg_chunk.reshape(-1)
         
@@ -64,6 +55,9 @@ def evaluate_link_prediction(encoder, predictor, data, split_edge, split='valid'
         neg_preds.append(torch.cat(chunk_neg).view(len(perm), num_neg_per_pos))
         
         del src, dst, dst_neg_chunk, src_rep, dst_neg_flat, chunk_neg
+    
+    del h
+    torch.cuda.empty_cache()
     
     pos_pred = torch.cat(pos_preds, dim=0)
     neg_pred = torch.cat(neg_preds, dim=0)

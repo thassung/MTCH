@@ -12,69 +12,64 @@ from tqdm import tqdm
 from .evaluator import evaluate_link_prediction, print_evaluation_results
 
 
-def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, device, grad_clip=None):
+def train_epoch(encoder, predictor, data, split_edge, optimizer, batch_size, device,
+                grad_clip=None, scaler=None):
     """
-    Train for one epoch with gradient clipping.
-    
-    Args:
-        encoder: GNN encoder model
-        predictor: Link predictor model
-        data: PyG Data object
-        split_edge: Dictionary with edge splits
-        optimizer: Optimizer
-        batch_size: Batch size
-        device: Device (cpu/cuda)
-        grad_clip: Max gradient norm (None to disable)
-    Returns:
-        Average loss for the epoch
+    Train for one epoch with gradient clipping and optional AMP.
+    Each mini-batch does one GNN forward + edge loss + backward.
     """
     encoder.train()
     predictor.train()
-    
+
     source_edge = split_edge['train']['source_node']
     target_edge = split_edge['train']['target_node']
-    
+
     total_loss = 0
     total_examples = 0
-    
-    # Mini-batch training
+    use_amp = scaler is not None
+
     for perm in DataLoader(torch.arange(source_edge.size(0)), batch_size, shuffle=True):
         optimizer.zero_grad()
-        
-        # Encode all nodes (data already on device via train_model)
-        h = encoder(data.x, data.edge_index)
-        
-        # Get positive edges (move batch slice to device)
-        src = source_edge[perm].to(device)
-        dst = target_edge[perm].to(device)
-        
-        # Positive predictions
-        pos_out = predictor(h[src], h[dst])
-        pos_loss = -torch.log(pos_out + 1e-15).mean()
-        
-        # Random negative sampling
-        dst_neg = torch.randint(0, data.num_nodes, src.size(),
-                               dtype=torch.long, device=device)
-        neg_out = predictor(h[src], h[dst_neg])
-        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
-        
-        # Total loss
-        loss = pos_loss + neg_loss
-        loss.backward()
-        
-        # Gradient clipping (prevents exploding gradients)
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(predictor.parameters()), 
-                grad_clip
-            )
-        
-        optimizer.step()
-        
+
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            h = encoder(data.x, data.edge_index)
+
+            src = source_edge[perm].to(device)
+            dst = target_edge[perm].to(device)
+
+            pos_out = predictor(h[src], h[dst])
+            pos_loss = -torch.log(pos_out + 1e-15).mean()
+
+            dst_neg = torch.randint(0, data.num_nodes, src.size(),
+                                   dtype=torch.long, device=device)
+            neg_out = predictor(h[src], h[dst_neg])
+            neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
+
+            loss = pos_loss + neg_loss
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    list(encoder.parameters()) + list(predictor.parameters()),
+                    grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    list(encoder.parameters()) + list(predictor.parameters()),
+                    grad_clip)
+            optimizer.step()
+
         num_examples = pos_out.size(0)
         total_loss += loss.item() * num_examples
         total_examples += num_examples
-    
+
+        del h, src, dst, dst_neg, pos_out, neg_out
+
     return total_loss / total_examples
 
 
@@ -85,33 +80,16 @@ def train_model(encoder, predictor, data, split_edge,
                 lr_scheduler='reduce_on_plateau', grad_clip=1.0):
     """
     Complete training loop with early stopping, LR scheduling, and checkpointing.
-    
-    Args:
-        encoder: GNN encoder model
-        predictor: Link predictor model
-        data: PyG Data object
-        split_edge: Dictionary with edge splits
-        epochs: Maximum training epochs (with early stopping, may stop earlier)
-        batch_size: Batch size
-        lr: Initial learning rate
-        eval_steps: Evaluate every N epochs
-        device: Device (cpu/cuda)
-        verbose: Print progress
-        patience: Early stopping patience (epochs without improvement)
-        min_delta: Minimum improvement to count as progress
-        weight_decay: L2 regularization strength
-        lr_scheduler: 'reduce_on_plateau', 'cosine', or None
-        grad_clip: Gradient clipping max norm (None to disable)
-    Returns:
-        Dictionary with training history
+    Uses mixed precision (AMP) on CUDA for lower memory usage.
     """
-    # Move models to device; keep only graph tensors on GPU
     encoder = encoder.to(device)
     predictor = predictor.to(device)
     data.x = data.x.to(device)
     data.edge_index = data.edge_index.to(device)
+
+    use_amp = (device != 'cpu' and torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
-    # Optimizer with weight decay (L2 regularization)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(predictor.parameters()),
         lr=lr,
@@ -154,9 +132,9 @@ def train_model(encoder, predictor, data, split_edge,
     for epoch in iterator:
         epoch_start = time.time()
         
-        # Train one epoch
         loss = train_epoch(encoder, predictor, data, split_edge, 
-                          optimizer, batch_size, device, grad_clip=grad_clip)
+                          optimizer, batch_size, device,
+                          grad_clip=grad_clip, scaler=scaler)
         
         epoch_time = time.time() - epoch_start
         history['train_loss'].append(loss)

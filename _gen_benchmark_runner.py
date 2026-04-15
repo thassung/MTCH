@@ -63,7 +63,7 @@ code(
 "\n"
 "# Full-graph training\n"
 "FULL_EPOCHS     = 500\n"
-"FULL_BATCH_SIZE = 8192\n"
+"FULL_BATCH_SIZE = 4096\n"
 "FULL_LR         = 0.005\n"
 "FULL_PATIENCE   = 30\n"
 "\n"
@@ -174,7 +174,8 @@ code(
 code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
-"    data = dd['data'].clone()\n"
+"    data = dd['data']\n"
+"    orig_edge_index = data.edge_index.clone()\n"
 "    data.edge_index = dd['train_edge_index']\n"
 "    split_edge = dd['split_edge']\n"
 "\n"
@@ -216,12 +217,14 @@ code(
 "            })\n"
 "\n"
 "        del encoder, predictor, result\n"
-"        torch.cuda.empty_cache()"
+"        torch.cuda.empty_cache()\n"
+"\n"
+"    data.edge_index = orig_edge_index\n"
+"    del orig_edge_index"
 )
 
 code(
 "import gc\n"
-"del data, split_edge\n"
 "gc.collect()\n"
 "torch.cuda.empty_cache()\n"
 "print('Full Graph done — GPU memory released.')"
