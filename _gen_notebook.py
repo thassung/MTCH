@@ -94,17 +94,6 @@ code(
 "from subgrapher.benchmark_learnable_ppr.finetuner import finetune_on_subgraphs, LearnablePPRExtractor, SubgraphCache, build_or_load_cache\n"
 "from subgrapher.benchmark_learnable_ppr.evaluator import evaluate_learnable_ppr, evaluate_learnable_ppr_fullgraph, print_evaluation_results\n"
 "from subgrapher.benchmark_learnable_ppr.artifacts import save_learnable_ppr_experiment\n"
-"\n"
-"# Patch tqdm in library modules so progress bars update in-place in Jupyter\n"
-"try:\n"
-"    from tqdm.notebook import tqdm as _ntqdm\n"
-"    import subgrapher.benchmark_learnable_ppr.searcher as _mod_s\n"
-"    import subgrapher.benchmark_learnable_ppr.finetuner as _mod_f\n"
-"    _mod_s.tqdm = _ntqdm\n"
-"    _mod_f.tqdm = _ntqdm\n"
-"    print('tqdm.notebook patched for in-place progress bars')\n"
-"except ImportError:\n"
-"    print('tqdm.notebook not available, using standard tqdm')"
 )
 
 md("## 1. Data Loading and Multi-Scale PPR")
