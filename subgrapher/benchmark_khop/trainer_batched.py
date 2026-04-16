@@ -84,7 +84,7 @@ class KHopSubgraphCache:
 
     @classmethod
     def load(cls, path):
-        d = torch.load(path, map_location='cpu')
+        d = torch.load(path, map_location='cpu', weights_only=False)
         return cls(d['selected_nodes'], d['edge_index'],
                    d['u_sub'], d['v_sub'], d['num_nodes'])
 
@@ -143,7 +143,8 @@ def train_epoch_khop_cached(encoder, predictor, data, cache, optimizer,
 
     dataloader = DataLoader(indices.tolist(), batch_size, shuffle=False)
     if verbose:
-        dataloader = tqdm(dataloader, desc='  Batches', leave=False)
+        dataloader = tqdm(dataloader, desc='  Batches', leave=False,
+                          mininterval=30)
 
     x_full = data.x
 
@@ -218,7 +219,8 @@ def train_model_khop_batched(encoder, predictor, data, split_edge, khop_extracto
                               eval_steps=5, device='cpu', verbose=True,
                               patience=30, min_delta=0.0001, weight_decay=1e-5,
                               lr_scheduler='reduce_on_plateau', grad_clip=1.0,
-                              edges_per_epoch=None, cache_dir=None):
+                              edges_per_epoch=None, cache_dir=None,
+                              max_eval_edges=2000):
     encoder = encoder.to(device)
     predictor = predictor.to(device)
 
@@ -268,9 +270,11 @@ def train_model_khop_batched(encoder, predictor, data, split_edge, khop_extracto
         history['learning_rates'].append(optimizer.param_groups[0]['lr'])
 
         if epoch % eval_steps == 0 or epoch == epochs:
+            me = None if epoch == epochs else max_eval_edges
             val_results = evaluate_khop(
                 encoder, predictor, data, split_edge, khop_extractor,
-                split='valid', batch_size=batch_size, device=device)
+                split='valid', batch_size=batch_size, device=device,
+                max_edges=me, cache_dir=cache_dir)
             history['val_results'].append(val_results)
 
             current_val_mrr = val_results['mrr']
