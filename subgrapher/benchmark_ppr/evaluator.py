@@ -41,24 +41,13 @@ class PPREvalCache:
             u = source[i].item()
             v = target[i].item()
 
-            ppr_u = ppr_extractor.preprocessor.get_ppr(u)
-            ppr_v = ppr_extractor.preprocessor.get_ppr(v)
-            combined = ppr_extractor.alpha * ppr_u + (1 - ppr_extractor.alpha) * ppr_v
-            top_k_actual = min(ppr_extractor.top_k, len(combined))
-            _, selected_nodes = torch.topk(combined, top_k_actual)
-
-            if u not in selected_nodes:
-                selected_nodes = torch.cat([selected_nodes, torch.tensor([u])])
-            if v not in selected_nodes:
-                selected_nodes = torch.cat([selected_nodes, torch.tensor([v])])
+            _, selected_nodes, metadata = ppr_extractor.extract_subgraph(u, v)
+            u_sub = metadata['u_subgraph']
+            v_sub = metadata['v_subgraph']
 
             edge_index_sub, _ = pyg_subgraph(
                 selected_nodes, data.edge_index,
                 relabel_nodes=True, num_nodes=data.num_nodes)
-
-            node_mapping = {node.item(): new_idx for new_idx, node in enumerate(selected_nodes)}
-            u_sub = node_mapping.get(u, -1)
-            v_sub = node_mapping.get(v, -1)
 
             sel_list.append(selected_nodes.cpu())
             ei_list.append(edge_index_sub.cpu())

@@ -50,25 +50,27 @@ def _long_running_tqdm(iterable, desc, heartbeat_mins=10, **kwargs):
 
 class LearnablePPRExtractor:
     """
-    Subgraph extractor that uses per-edge learned PPR configurations.
+    Subgraph extractor that uses per-edge learned PPR configurations
+    with LCILP-style approximate PPR + conductance sweep cut.
 
     For each edge (u,v), uses the arch_net-selected (teleport_u, teleport_v)
-    to determine which PPR vectors to combine, then extracts top-k nodes.
+    as alpha parameters for two single-seed approximate PPRs, combines
+    the results, then applies a conductance sweep cut for adaptive
+    subgraph selection (replaces fixed top-k).
 
     Args:
         data: PyG Data object (full graph)
-        multi_scale_ppr: MultiScalePPR instance
+        multi_scale_ppr: MultiScalePPR instance (for config_index -> teleport mapping)
         config_indices: Tensor [num_edges] of learned config index per edge
-        alpha: Combination weights for PPR_u and PPR_v.
-               List of length 1: w_u = alpha[0], w_v = 1 - alpha[0].
-               List of length 2: (w_u, w_v) normalized to sum 1.
-               Scalar accepted for backwards compatibility.
-        top_k: Number of nodes to select per subgraph
+        alpha: Combination weights for PPR_u and PPR_v (blend parameter).
+        epsilon: Approximate PPR precision threshold (default: 1e-3)
+        window: Conductance sweep cut window (default: 10)
     """
 
     def __init__(self, data, multi_scale_ppr, config_indices,
-                 alpha=None, top_k=100):
+                 alpha=None, epsilon=1e-3, window=10):
         from . import resolve_alpha_weights
+        from ..utils.local_ppr import build_sparse_adj
         self.data = data
         self.multi_scale_ppr = multi_scale_ppr
         self.config_indices = config_indices
@@ -76,37 +78,35 @@ class LearnablePPRExtractor:
             alpha = [0.5]
         self.alpha = alpha
         self.w_u, self.w_v = resolve_alpha_weights(alpha)
-        self.top_k = top_k
+        self.epsilon = epsilon
+        self.window = window
+        self.adj_csr = build_sparse_adj(data.edge_index, data.num_nodes)
 
     def extract_subgraph(self, u, v, edge_idx):
         """
         Extract subgraph for edge (u,v) using its learned PPR config.
+
+        Two single-seed approximate PPRs (one per endpoint with the
+        learned teleport/alpha), combined, then conductance sweep cut.
 
         Returns:
             subgraph_data: PyG Data with remapped indices
             selected_nodes: Original node indices
             metadata: Dict with u_subgraph, v_subgraph, config info
         """
+        from ..utils.local_ppr import combine_ppr_and_sweep
+
         config_idx = self.config_indices[edge_idx].item()
         teleport_u, teleport_v = self.multi_scale_ppr.get_config_for_index(
             config_idx)
 
-        ppr_u = self.multi_scale_ppr.get_ppr(u, teleport_u)
-        ppr_v = self.multi_scale_ppr.get_ppr(v, teleport_v)
+        community = combine_ppr_and_sweep(
+            self.adj_csr, u, v,
+            alpha_u=teleport_u, alpha_v=teleport_v,
+            epsilon=self.epsilon, blend=self.w_u,
+            window=self.window)
 
-        combined = self.w_u * ppr_u + self.w_v * ppr_v
-        top_k_actual = min(self.top_k, len(combined))
-        _, selected_nodes = torch.topk(combined, top_k_actual)
-
-        dev = self.data.edge_index.device
-        selected_nodes = selected_nodes.detach().to(dev).long()
-
-        if not (selected_nodes == u).any():
-            selected_nodes = torch.cat(
-                [selected_nodes, torch.tensor([u], device=dev, dtype=torch.long)])
-        if not (selected_nodes == v).any():
-            selected_nodes = torch.cat(
-                [selected_nodes, torch.tensor([v], device=dev, dtype=torch.long)])
+        selected_nodes = torch.tensor(sorted(community), dtype=torch.long)
 
         edge_index_sub, _ = subgraph(
             selected_nodes, self.data.edge_index,
@@ -166,7 +166,12 @@ class SubgraphCache:
 
     @classmethod
     def build_fast(cls, extractor, split_edge, split='train', verbose=True):
-        """Extract subgraphs storing topology compactly (CPU tensors)."""
+        """Extract subgraphs storing topology compactly (CPU tensors).
+
+        Uses the extractor's approximate PPR + sweep cut logic.
+        """
+        from ..utils.local_ppr import combine_ppr_and_sweep
+
         source = split_edge[split]['source_node']
         target = split_edge[split]['target_node']
         n = source.size(0)
@@ -176,6 +181,7 @@ class SubgraphCache:
 
         edge_index_cpu = extractor.data.edge_index.cpu()
         num_graph_nodes = extractor.data.num_nodes
+        adj_csr = extractor.adj_csr
 
         it = (_long_running_tqdm(range(n), desc=f'Caching {split} subgraphs')
               if verbose else range(n))
@@ -186,20 +192,13 @@ class SubgraphCache:
             config_idx = extractor.config_indices[i].item()
             teleport_u, teleport_v = extractor.multi_scale_ppr.get_config_for_index(config_idx)
 
-            ppr_u = extractor.multi_scale_ppr.get_ppr(u, teleport_u)
-            ppr_v = extractor.multi_scale_ppr.get_ppr(v, teleport_v)
+            community = combine_ppr_and_sweep(
+                adj_csr, u, v,
+                alpha_u=teleport_u, alpha_v=teleport_v,
+                epsilon=extractor.epsilon, blend=extractor.w_u,
+                window=extractor.window)
 
-            combined = extractor.w_u * ppr_u + extractor.w_v * ppr_v
-            top_k_actual = min(extractor.top_k, len(combined))
-            _, selected_nodes = torch.topk(combined, top_k_actual)
-            selected_nodes = selected_nodes.cpu().long()
-
-            if not (selected_nodes == u).any():
-                selected_nodes = torch.cat(
-                    [selected_nodes, torch.tensor([u], dtype=torch.long)])
-            if not (selected_nodes == v).any():
-                selected_nodes = torch.cat(
-                    [selected_nodes, torch.tensor([v], dtype=torch.long)])
+            selected_nodes = torch.tensor(sorted(community), dtype=torch.long)
 
             edge_index_sub, _ = subgraph(
                 selected_nodes, edge_index_cpu,
@@ -243,7 +242,7 @@ class SubgraphCache:
 
     @classmethod
     def load(cls, path):
-        d = torch.load(path, map_location='cpu')
+        d = torch.load(path, map_location='cpu', weights_only=False)
         return cls(d['selected_nodes'], d['edge_index'],
                    d['u_sub'], d['v_sub'], d['num_nodes'])
 
@@ -403,7 +402,8 @@ def train_epoch_finetune(encoder, predictor, data, cache, optimizer,
 
 def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                            multi_scale_ppr, config_indices,
-                           alpha=None, top_k=100, epochs=200,
+                           alpha=None, epsilon=1e-3, window=10,
+                           epochs=200,
                            batch_size=8192, lr=0.005, eval_steps=5,
                            device='cpu', verbose=True, patience=20,
                            weight_decay=1e-5, grad_clip=1.0,
@@ -415,6 +415,10 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
     """
     Phase 2: Fine-tune encoder+predictor on subgraphs with learned configs.
 
+    Uses LCILP-style approximate PPR + conductance sweep cut for subgraph
+    extraction.  Per-edge (teleport_u, teleport_v) from Phase 1 serve as
+    the alpha parameters for two single-seed approximate PPRs.
+
     Args:
         encoder: GNN encoder
         predictor: LinkPredictor
@@ -423,7 +427,8 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         multi_scale_ppr: MultiScalePPR instance
         config_indices: Tensor [num_train_edges] of learned config per edge
         alpha: PPR combination weights (list). See resolve_alpha_weights().
-        top_k: Subgraph size
+        epsilon: Approximate PPR precision (default: 1e-3)
+        window: Conductance sweep cut window (default: 10)
         epochs: Max training epochs
         batch_size: Edges per batch
         lr: Learning rate
@@ -458,7 +463,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
     # ---- build / load subgraph caches ------------------------------------
     extractor = LearnablePPRExtractor(
         data, multi_scale_ppr, config_indices,
-        alpha=alpha, top_k=top_k)
+        alpha=alpha, epsilon=epsilon, window=window)
 
     train_cache = build_or_load_cache(
         extractor, split_edge, 'train', cache_dir, verbose)
@@ -489,7 +494,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         os.makedirs(checkpoint_dir, exist_ok=True)
         ckpt_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
         if os.path.isfile(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             encoder.load_state_dict(ckpt['encoder'])
             predictor.load_state_dict(ckpt['predictor'])
             optimizer.load_state_dict(ckpt['optimizer'])
@@ -532,7 +537,8 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
             val_results = evaluate_learnable_ppr(
                 encoder, predictor, data, split_edge,
                 multi_scale_ppr, val_config_indices,
-                split='valid', alpha=alpha, top_k=top_k,
+                split='valid', alpha=alpha,
+                epsilon=epsilon, window=window,
                 batch_size=batch_size, device=device,
                 cache_dir=cache_dir)
             history['val_results'].append(val_results)

@@ -51,44 +51,19 @@ def train_epoch_ppr(encoder, predictor, data, split_edge, ppr_extractor,
         batch_loss = 0
         batch_examples = 0
         
-        # Process each edge with its OWN isolated subgraph
         for i in perm:
             u = source_edge[i].item()
             v = target_edge[i].item()
-            
-            # Get precomputed PPR scores (fast O(1) lookup!)
-            ppr_u = ppr_extractor.preprocessor.get_ppr(u)
-            ppr_v = ppr_extractor.preprocessor.get_ppr(v)
-            
-            # Combine and select top-k for THIS EDGE ONLY
-            combined_scores = ppr_extractor.alpha * ppr_u + (1 - ppr_extractor.alpha) * ppr_v
-            top_k_actual = min(ppr_extractor.top_k, len(combined_scores))
-            _, selected_nodes = torch.topk(combined_scores, top_k_actual)
-            
-            # Always include u and v
-            if u not in selected_nodes:
-                selected_nodes = torch.cat([selected_nodes, torch.tensor([u])])
-            if v not in selected_nodes:
-                selected_nodes = torch.cat([selected_nodes, torch.tensor([v])])
-            
-            # Extract subgraph edges for THIS edge's subgraph
-            from torch_geometric.utils import subgraph
-            edge_index_sub, _ = subgraph(
-                selected_nodes, data.edge_index,
-                relabel_nodes=True, num_nodes=data.num_nodes
-            )
-            
-            # Create node mapping
-            node_mapping = {node.item(): idx for idx, node in enumerate(selected_nodes)}
-            u_sub = node_mapping.get(u, -1)
-            v_sub = node_mapping.get(v, -1)
-            
+
+            subgraph_data, selected_nodes, metadata = ppr_extractor.extract_subgraph(u, v)
+            u_sub = metadata['u_subgraph']
+            v_sub = metadata['v_subgraph']
+
             if u_sub == -1 or v_sub == -1:
                 continue
-            
-            # Encode THIS edge's subgraph (isolated!)
-            x_sub = data.x[selected_nodes].to(device)
-            edge_index_sub = edge_index_sub.to(device)
+
+            x_sub = subgraph_data.x.to(device)
+            edge_index_sub = subgraph_data.edge_index.to(device)
             h = encoder(x_sub, edge_index_sub)
             
             # Positive prediction

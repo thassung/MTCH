@@ -58,7 +58,7 @@ def save_learnable_ppr_experiment(
     run_id,
     teleport_values,
     alpha,
-    top_k,
+    epsilon,
     exp,
     multi_scale_ppr,
     extra_config=None,
@@ -73,7 +73,7 @@ def save_learnable_ppr_experiment(
         run_id: Unique run timestamp / identifier string.
         teleport_values: List of PPR teleport probabilities used.
         alpha: Combination weight list (e.g. [0.5]).
-        top_k: Subgraph size.
+        epsilon: Approximate PPR precision threshold.
         exp: The experiment dict stored in all_results[dataset][encoder],
              expected keys: search_history, ft_history, test_results,
              ft_encoder, ft_predictor, model (AutoLinkPPR), arch_net,
@@ -98,7 +98,7 @@ def save_learnable_ppr_experiment(
         'timestamp': datetime.now().isoformat(),
         'teleport_values': teleport_values,
         'alpha': alpha,
-        'top_k': top_k,
+        'ppr_epsilon': epsilon,
         'search': {
             'best_epoch': search_hist.get('best_epoch'),
             'best_val_loss': search_hist.get('best_val_loss'),

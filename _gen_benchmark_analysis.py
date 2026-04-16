@@ -5,7 +5,7 @@ Visualization plan by Lucy (data engineer):
  1. Summary leaderboard table
  2. Headline MRR by method (faceted by dataset, collapsed to best config)
  3. Encoder sensitivity (faceted by encoder)
- 4. Static PPR: MRR vs top_k (line)
+ 4. Static PPR: MRR by (alpha, epsilon) config
  5. k-hop: MRR vs k (line)
  6. Time vs MRR scatter
  7. Cross-dataset relative MRR
@@ -51,7 +51,7 @@ md(
 "## 0. Setup & Data Loading\n"
 "\n"
 "**Best-config rule**: For methods with multiple configurations (Static PPR\n"
-"has 5 `top_k` values, k-hop has 3 `k` values), the **summary figures** show\n"
+"has `alpha x epsilon` configs, k-hop has 3 `k` values), the **summary figures** show\n"
 "only the **best config per (dataset, encoder)** selected by highest test MRR.\n"
 "The sensitivity figures (Sections 4–5) show all configs."
 )
@@ -90,14 +90,16 @@ code(
 "def _classify(r, method):\n"
 "    \"\"\"Return (config_label, config_value) from a full_results.json dict.\"\"\"\n"
 "    if method == 'Static PPR':\n"
-"        tk = r.get('top_k', r.get('config', {}).get('top_k', '?'))\n"
-"        return f'top_k={tk}', tk\n"
+"        a = r.get('ppr_alpha', r.get('config', {}).get('ppr_alpha', '?'))\n"
+"        e = r.get('ppr_epsilon', r.get('config', {}).get('ppr_epsilon',\n"
+"            r.get('top_k', r.get('config', {}).get('top_k', '?'))))\n"
+"        return f'a={a},e={e}', f'{a}_{e}'\n"
 "    if method == 'Static k-hop':\n"
 "        k = r.get('k', r.get('config', {}).get('k', '?'))\n"
 "        return f'k={k}', k\n"
 "    if method == 'Learnable PPR':\n"
-"        tk = r.get('top_k', '?')\n"
-"        return f'top_k={tk}', tk\n"
+"        e = r.get('ppr_epsilon', r.get('top_k', '?'))\n"
+"        return f'eps={e}', e\n"
 "    return '-', None\n"
 "\n"
 "def _detect_method(r):\n"
@@ -106,7 +108,7 @@ code(
 "        return 'Learnable PPR'\n"
 "    if 'k' in r or r.get('config', {}).get('k'):\n"
 "        return 'Static k-hop'\n"
-"    if 'top_k' in r or 'ppr_alpha' in r.get('config', {}):\n"
+"    if 'ppr_alpha' in r or 'ppr_epsilon' in r or 'top_k' in r or 'ppr_alpha' in r.get('config', {}):\n"
 "        return 'Static PPR'\n"
 "    return 'Full Graph'\n"
 "\n"
@@ -184,7 +186,7 @@ code(
 # ── Build collapsed summary (best config per method-dataset-encoder) ──────────
 code(
 "# For each (method, dataset, encoder), keep only the row with highest MRR\n"
-"# This collapses PPR top_k and k-hop k to the single best.\n"
+"# This collapses PPR (alpha, epsilon) and k-hop k to the single best.\n"
 "\n"
 "if not df.empty:\n"
 "    idx_best = df.groupby(['method', 'dataset', 'encoder'])['mrr'].idxmax()\n"
@@ -230,7 +232,7 @@ code(
 md(
 "## 2. Headline: Best MRR by Method\n"
 "\n"
-"Each bar is the **best config** for that method (e.g., PPR with optimal `top_k`).\n"
+"Each bar is the **best config** for that method (e.g., PPR with optimal alpha/epsilon).\n"
 "Faceted by dataset."
 )
 
@@ -296,37 +298,43 @@ code(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. PPR: MRR vs top_k
+# 4. PPR: MRR by (alpha, epsilon) config
 # ═══════════════════════════════════════════════════════════════════════════════
 md(
-"## 4. Static PPR: MRR vs `top_k`\n"
+"## 4. Static PPR: MRR by Configuration\n"
 "\n"
-"How sensitive is PPR performance to the subgraph size? One line per encoder,\n"
-"faceted by dataset."
+"How sensitive is PPR performance to `(alpha, epsilon)`? Grouped bar chart\n"
+"per encoder, faceted by dataset."
 )
 
 code(
 "ppr_df = df[df['method'] == 'Static PPR'].copy()\n"
-"if not ppr_df.empty and 'config_value' in ppr_df.columns:\n"
-"    ppr_df['top_k'] = pd.to_numeric(ppr_df['config_value'], errors='coerce')\n"
-"    ppr_df = ppr_df.dropna(subset=['top_k'])\n"
+"if not ppr_df.empty and 'config_label' in ppr_df.columns:\n"
 "    ds_list = sorted(ppr_df['dataset'].unique())\n"
 "    n_ds = len(ds_list)\n"
 "\n"
-"    fig, axes = plt.subplots(1, n_ds, figsize=(5.5 * n_ds, 4), squeeze=False)\n"
+"    fig, axes = plt.subplots(1, max(n_ds, 1), figsize=(6 * max(n_ds, 1), 4.5), squeeze=False)\n"
 "    for i, ds in enumerate(ds_list):\n"
 "        ax = axes[0, i]\n"
-"        for enc in sorted(ppr_df['encoder'].unique()):\n"
-"            sub = ppr_df[(ppr_df['dataset'] == ds) & (ppr_df['encoder'] == enc)]\n"
-"            sub = sub.sort_values('top_k')\n"
-"            ax.plot(sub['top_k'], sub['mrr'], marker='o', markersize=5,\n"
-"                    color=ENCODER_COLORS.get(enc, '#999'), label=enc)\n"
-"        ax.set_xlabel('top_k'); ax.set_ylabel('MRR')\n"
+"        sub = ppr_df[ppr_df['dataset'] == ds].copy()\n"
+"        configs = sorted(sub['config_label'].unique())\n"
+"        encs = sorted(sub['encoder'].unique())\n"
+"        x = np.arange(len(configs))\n"
+"        w = 0.8 / max(len(encs), 1)\n"
+"        for j, enc in enumerate(encs):\n"
+"            vals = []\n"
+"            for cfg in configs:\n"
+"                row = sub[(sub['encoder'] == enc) & (sub['config_label'] == cfg)]\n"
+"                vals.append(row['mrr'].values[0] if len(row) > 0 else 0)\n"
+"            ax.bar(x + j * w, vals, w, label=enc,\n"
+"                   color=ENCODER_COLORS.get(enc, '#999'))\n"
+"        ax.set_xticks(x + w * (len(encs) - 1) / 2)\n"
+"        ax.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)\n"
+"        ax.set_ylabel('MRR')\n"
 "        ax.set_title(ds, fontsize=12, fontweight='bold')\n"
 "        ax.legend(fontsize=9)\n"
-"        ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))\n"
 "\n"
-"    fig.suptitle('Static PPR — MRR vs top_k',\n"
+"    fig.suptitle('Static PPR — MRR by (alpha, epsilon)',\n"
 "                 fontsize=14, fontweight='bold', y=1.02)\n"
 "    plt.tight_layout()\n"
 "    plt.show()\n"

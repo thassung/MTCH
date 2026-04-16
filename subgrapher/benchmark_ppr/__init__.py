@@ -1,6 +1,6 @@
 """
 Static PPR-based subgraph benchmark.
-Compares different top-k values for PPR-based subgraph selection.
+Uses LCILP-style approximate PPR + conductance sweep cut.
 """
 
 from .ppr_extractor import StaticPPRExtractor

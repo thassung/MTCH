@@ -1,13 +1,14 @@
 """
 PPR (Personalized PageRank) preprocessor.
 Precomputes PPR scores for all nodes once, stores for fast lookup.
+
+Uses the approximate push algorithm (Andersen et al. 2006) for speed.
 """
 
 import torch
-import networkx as nx
-from torch_geometric.utils import to_networkx
+import numpy as np
 from tqdm import tqdm
-from subgrapher.utils.ppr_scorer import personalized_pagerank
+from subgrapher.utils.local_ppr import approximate_ppr, build_sparse_adj
 
 
 class PPRPreprocessor:
@@ -17,53 +18,49 @@ class PPRPreprocessor:
     Args:
         data: PyG Data object
         ppr_alpha: Teleport probability for PPR (default: 0.85)
+        epsilon: Approximate PPR precision (default: 1e-4).
+                 Smaller = more accurate but slower.
     """
     
-    def __init__(self, data, ppr_alpha=0.85, log_file=None):
+    def __init__(self, data, ppr_alpha=0.85, epsilon=1e-4, log_file=None):
         self.num_nodes = data.num_nodes
         self.ppr_alpha = ppr_alpha
+        self.epsilon = epsilon
         self.ppr_cache = {}
         
         print(f"PPRPreprocessor: Precomputing PPR for {data.num_nodes} nodes...")
-        print(f"  Converting to NetworkX...")
-        self.G = to_networkx(data, to_undirected=True)
-        self.nodes = sorted(self.G.nodes())
+        print(f"  Building sparse adjacency...")
+        self.adj_csr = build_sparse_adj(data.edge_index, data.num_nodes)
+        self.nodes = list(range(data.num_nodes))
         
-        print(f"  Computing PPR (alpha={ppr_alpha})...")
+        print(f"  Computing approximate PPR (alpha={ppr_alpha}, epsilon={epsilon})...")
         if log_file:
             print(f"  Logging PPR arrays to: {log_file}")
         self._precompute_all(log_file=log_file)
-        print(f"  ✓ Cached {len(self.ppr_cache)} PPR vectors")
+        print(f"  Cached {len(self.ppr_cache)} PPR vectors")
         
-        # Memory estimate
-        memory_mb = len(self.ppr_cache) * self.num_nodes * 4 / (1024 * 1024)  # 4 bytes per float32
+        memory_mb = len(self.ppr_cache) * self.num_nodes * 4 / (1024 * 1024)
         print(f"  Cache memory: ~{memory_mb:.1f} MB")
     
     def _precompute_all(self, log_file=None):
-        """Precompute PPR for all nodes."""
+        """Precompute PPR for all nodes using approximate push."""
         log_handle = None
         if log_file:
             log_handle = open(log_file, 'w')
-            log_handle.write(f"# PPR Preprocessing Log (alpha={self.ppr_alpha})\n")
+            log_handle.write(f"# PPR Preprocessing Log (alpha={self.ppr_alpha}, "
+                             f"epsilon={self.epsilon})\n")
             log_handle.write(f"# Format: node_id | ppr_scores (space-separated)\n\n")
         
         try:
-            for node in tqdm(range(self.num_nodes), desc="  Computing PPR", leave=False):
-                # Prepare seed distribution
-                seeds = {n: 1.0 if n == node else 0.0 for n in self.nodes}
+            for node in tqdm(range(self.num_nodes), desc="  Computing PPR",
+                             leave=False, mininterval=10):
+                ppr_array = approximate_ppr(
+                    self.adj_csr, {node},
+                    alpha=self.ppr_alpha, epsilon=self.epsilon)
                 
-                # Compute PPR using existing function
-                ppr_dict = personalized_pagerank(self.G, seeds, alpha=self.ppr_alpha)
-                
-                # Convert to tensor in consistent order
-                ppr_tensor = torch.tensor(
-                    [ppr_dict[n] for n in self.nodes], 
-                    dtype=torch.float32
-                )
-                
+                ppr_tensor = torch.from_numpy(ppr_array).float()
                 self.ppr_cache[node] = ppr_tensor
                 
-                # Log to file if enabled
                 if log_handle:
                     ppr_values = ' '.join(f"{v:.6f}" for v in ppr_tensor.tolist())
                     log_handle.write(f"{node} | {ppr_values}\n")
@@ -149,6 +146,7 @@ class PPRPreprocessor:
         """Save preprocessor cache to disk."""
         torch.save({
             'ppr_alpha': self.ppr_alpha,
+            'epsilon': self.epsilon,
             'num_nodes': self.num_nodes,
             'ppr_cache': self.ppr_cache,
         }, path)
@@ -157,19 +155,19 @@ class PPRPreprocessor:
     @classmethod
     def load(cls, path, data=None):
         """Load preprocessor cache from disk."""
-        saved_data = torch.load(path)
+        saved_data = torch.load(path, weights_only=False)
         preprocessor = cls.__new__(cls)
         preprocessor.ppr_alpha = saved_data['ppr_alpha']
         preprocessor.num_nodes = saved_data['num_nodes']
         preprocessor.ppr_cache = saved_data['ppr_cache']
-        
-        # Optional: set G and nodes if data is provided
+        preprocessor.epsilon = saved_data.get('epsilon', 1e-4)
+        preprocessor.nodes = list(range(preprocessor.num_nodes))
+
         if data is not None:
-            preprocessor.G = to_networkx(data, to_undirected=True)
-            preprocessor.nodes = sorted(preprocessor.G.nodes())
+            preprocessor.adj_csr = build_sparse_adj(
+                data.edge_index, data.num_nodes)
         else:
-            preprocessor.G = None
-            preprocessor.nodes = list(range(preprocessor.num_nodes))
+            preprocessor.adj_csr = None
         
         print(f"Loaded PPRPreprocessor from {path}")
         return preprocessor

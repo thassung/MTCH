@@ -97,12 +97,16 @@ def evaluate_learnable_ppr_fullgraph(encoder, predictor, data, split_edge,
 @torch.no_grad()
 def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
                             multi_scale_ppr, config_indices,
-                            split='valid', alpha=None, top_k=100,
+                            split='valid', alpha=None,
+                            epsilon=1e-3, window=10,
                             batch_size=65536, device='cpu',
                             K_values=None,
                             cache_dir=None):
     """
     Evaluate link prediction with learned per-edge PPR configurations.
+
+    Uses LCILP-style approximate PPR + conductance sweep cut for
+    subgraph extraction (same as training in Phase 2).
 
     If *cache_dir* is provided the function loads (or builds + saves)
     a SubgraphCache so repeated evaluations are fast.
@@ -116,7 +120,8 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         config_indices: Tensor of config indices (for the evaluated split)
         split: 'valid' or 'test'
         alpha: PPR combination weights (list). See resolve_alpha_weights().
-        top_k: Subgraph size
+        epsilon: Approximate PPR precision (default: 1e-3)
+        window: Conductance sweep cut window (default: 10)
         batch_size: Not used for per-edge eval but kept for API compat
         device: Device
         K_values: Hit@K values to compute
@@ -128,13 +133,14 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
     from . import resolve_alpha_weights
     from .finetuner import (LearnablePPRExtractor, SubgraphCache,
                             build_or_load_cache, _long_running_tqdm)
+    from ..utils.local_ppr import combine_ppr_and_sweep, build_sparse_adj
 
     if alpha is None:
         alpha = [0.5]
     if K_values is None:
         K_values = [1, 3, 10, 50, 100]
 
-    w_u, w_v = resolve_alpha_weights(alpha)
+    w_u, _ = resolve_alpha_weights(alpha)
 
     encoder.eval()
     predictor.eval()
@@ -146,14 +152,17 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
     num_pos = source.size(0)
     num_neg_per_pos = target_neg.size(1)
 
-    # ---- optionally use cache --------------------------------------------
     cache = None
     if cache_dir is not None:
         extractor = LearnablePPRExtractor(
             data, multi_scale_ppr, config_indices,
-            alpha=alpha, top_k=top_k)
+            alpha=alpha, epsilon=epsilon, window=window)
         cache = build_or_load_cache(
             extractor, split_edge, split, cache_dir, verbose=False)
+
+    adj_csr = None
+    if cache is None:
+        adj_csr = build_sparse_adj(data.edge_index, data.num_nodes)
 
     pos_preds = []
     neg_preds = []
@@ -164,7 +173,6 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         v_pos = target[idx].item()
         v_negs = target_neg[idx]
 
-        # --- get subgraph (cached or live) ---
         if cache is not None:
             sub_data, u_sub, v_sub = cache.make_data(idx, data.x)
             if sub_data is None:
@@ -179,22 +187,12 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
                 cfg_idx = 0
             teleport_u, teleport_v = multi_scale_ppr.get_config_for_index(cfg_idx)
 
-            ppr_u = multi_scale_ppr.get_ppr(u, teleport_u)
-            ppr_v = multi_scale_ppr.get_ppr(v_pos, teleport_v)
-            combined = w_u * ppr_u + w_v * ppr_v
+            community = combine_ppr_and_sweep(
+                adj_csr, u, v_pos,
+                alpha_u=teleport_u, alpha_v=teleport_v,
+                epsilon=epsilon, blend=w_u, window=window)
 
-            k_actual = min(top_k, len(combined))
-            _, selected_nodes = torch.topk(combined, k_actual)
-
-            dev = data.edge_index.device
-            selected_nodes = selected_nodes.detach().to(dev).long()
-
-            if not (selected_nodes == u).any():
-                selected_nodes = torch.cat(
-                    [selected_nodes, torch.tensor([u], device=dev, dtype=torch.long)])
-            if not (selected_nodes == v_pos).any():
-                selected_nodes = torch.cat(
-                    [selected_nodes, torch.tensor([v_pos], device=dev, dtype=torch.long)])
+            selected_nodes = torch.tensor(sorted(community), dtype=torch.long)
 
             edge_index_sub, _ = subgraph(
                 selected_nodes, data.edge_index,
@@ -220,7 +218,6 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         pos_preds.append(pos_pred.item())
 
         neg_pred_list = []
-        sel_dev = selected_nodes.device
         for v_neg in v_negs:
             v_neg_item = v_neg.item()
             node_mask = (selected_nodes == v_neg_item)
@@ -232,6 +229,8 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
             else:
                 neg_pred_list.append(0.1)
         neg_preds.append(neg_pred_list)
+
+        del h, sub_data
 
     pos_preds = torch.tensor(pos_preds)
     neg_preds = torch.tensor(neg_preds)

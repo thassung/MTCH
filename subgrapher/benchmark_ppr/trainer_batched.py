@@ -24,7 +24,7 @@ class PPRSubgraphCache:
 
     Stores topology only (selected_nodes, edge_index, u_sub, v_sub).
     Node features are sliced from ``data.x`` at training time.
-    Cache is shared across encoders for the same (dataset, top_k).
+    Cache is shared across encoders for the same (dataset, alpha, epsilon).
     """
 
     def __init__(self, selected_nodes, edge_index, u_sub, v_sub, num_nodes):
@@ -43,29 +43,19 @@ class PPRSubgraphCache:
         sel_list, ei_list, u_list, v_list, nn_list = [], [], [], [], []
         skipped = 0
 
-        it = tqdm(range(n), desc='Building PPR cache', leave=False) if verbose else range(n)
+        it = tqdm(range(n), desc='Building PPR cache', leave=False,
+                  mininterval=10) if verbose else range(n)
         for i in it:
             u = source_edge[i].item()
             v = target_edge[i].item()
 
-            ppr_u = ppr_extractor.preprocessor.get_ppr(u)
-            ppr_v = ppr_extractor.preprocessor.get_ppr(v)
-            combined = ppr_extractor.alpha * ppr_u + (1 - ppr_extractor.alpha) * ppr_v
-            top_k_actual = min(ppr_extractor.top_k, len(combined))
-            _, selected_nodes = torch.topk(combined, top_k_actual)
-
-            if u not in selected_nodes:
-                selected_nodes = torch.cat([selected_nodes, torch.tensor([u])])
-            if v not in selected_nodes:
-                selected_nodes = torch.cat([selected_nodes, torch.tensor([v])])
+            _, selected_nodes, metadata = ppr_extractor.extract_subgraph(u, v)
+            u_sub = metadata['u_subgraph']
+            v_sub = metadata['v_subgraph']
 
             edge_index_sub, _ = subgraph(
                 selected_nodes, data.edge_index,
                 relabel_nodes=True, num_nodes=data.num_nodes)
-
-            node_mapping = {node.item(): new_idx for new_idx, node in enumerate(selected_nodes)}
-            u_sub = node_mapping.get(u, -1)
-            v_sub = node_mapping.get(v, -1)
 
             if u_sub == -1 or v_sub == -1:
                 sel_list.append(torch.zeros(0, dtype=torch.long))

@@ -62,7 +62,8 @@ DEFAULT_CONFIG = {
     # PPR
     'teleport_values': [0.50, 0.85, 0.95],
     'alpha': [0.5],
-    'top_k': 100,
+    'ppr_epsilon': 1e-3,
+    'ppr_window': 10,
     'datasets': ['FB15K237'],
     'encoders': ['SAGE'],
 }
@@ -188,7 +189,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
     # ══════════════════════════════════════════════════════════════════════
     print(f"\n{'─' * 60}")
     print(f"Phase 2: Fine-tune on Subgraphs "
-          f"(top_k={config['top_k']}, {config['finetune_epochs']} epochs)")
+          f"(eps={config['ppr_epsilon']}, window={config['ppr_window']}, "
+          f"{config['finetune_epochs']} epochs)")
     print(f"{'─' * 60}")
 
     ft_encoder = create_encoder(
@@ -218,7 +220,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         ft_encoder, ft_predictor, data, split_edge,
         multi_scale_ppr, train_configs,
         alpha=config['alpha'],
-        top_k=config['top_k'],
+        epsilon=config['ppr_epsilon'],
+        window=config['ppr_window'],
         epochs=config['finetune_epochs'],
         batch_size=config['finetune_batch_size'],
         lr=config['finetune_lr'],
@@ -241,7 +244,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
     test_results = evaluate_learnable_ppr(
         ft_encoder, ft_predictor, data, split_edge,
         multi_scale_ppr, test_configs,
-        split='test', alpha=config['alpha'], top_k=config['top_k'],
+        split='test', alpha=config['alpha'],
+        epsilon=config['ppr_epsilon'], window=config['ppr_window'],
         device=device,
         cache_dir=cache_dir)
     print_evaluation_results(test_results, 'test')
@@ -257,7 +261,8 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         'num_params_finetune': num_params_ft,
         'teleport_values': config['teleport_values'],
         'num_configs': num_configs,
-        'top_k': config['top_k'],
+        'ppr_epsilon': config['ppr_epsilon'],
+        'ppr_window': config['ppr_window'],
         'alpha': _alpha_for_json(config['alpha']),
         'search_time': search_history['total_time'],
         'finetune_time': ft_history.get('total_time', 0),
@@ -324,7 +329,7 @@ def run_single_experiment(dataset_name, dataset_path, encoder_type, config,
         }
         save_learnable_ppr_experiment(
             run_dir, dataset_name, encoder_type, run_id,
-            config['teleport_values'], config['alpha'], config['top_k'],
+            config['teleport_values'], config['alpha'], config['ppr_epsilon'],
             exp_bundle, multi_scale_ppr, extra_config=extra_hp)
         print(f"  Run artifacts: {run_dir}")
 
@@ -348,7 +353,8 @@ def _save_summary(save_dir, result):
         f.write(f"  Teleport values: {result['teleport_values']}\n")
         f.write(f"  Num configs:     {result['num_configs']}\n")
         f.write(f"  Alpha (fixed):   {result['alpha']!r}\n")
-        f.write(f"  Top-K:           {result['top_k']}\n\n")
+        f.write(f"  PPR epsilon:     {result['ppr_epsilon']}\n")
+        f.write(f"  PPR window:      {result['ppr_window']}\n\n")
 
         f.write(f"Timing:\n")
         f.write(f"  Search time:     {result['search_time']:.1f}s\n")
@@ -444,7 +450,10 @@ def main():
     parser.add_argument('--teleport_values', nargs='+', type=float,
                         default=[0.50, 0.85, 0.95],
                         help='Teleport probabilities for PPR search space')
-    parser.add_argument('--top_k', type=int, default=100)
+    parser.add_argument('--ppr_epsilon', type=float, default=1e-3,
+                        help='Approximate PPR precision (Phase 2)')
+    parser.add_argument('--ppr_window', type=int, default=10,
+                        help='Sweep cut window (Phase 2)')
     parser.add_argument('--alpha', type=float, nargs='+', default=[0.5],
                         help='PPR combination weights (1 or 2 values)')
     parser.add_argument('--device', type=str, default='auto',
@@ -486,7 +495,8 @@ def main():
         'datasets': args.datasets,
         'encoders': args.encoders,
         'teleport_values': sorted(args.teleport_values),
-        'top_k': args.top_k,
+        'ppr_epsilon': args.ppr_epsilon,
+        'ppr_window': args.ppr_window,
         'alpha': args.alpha,
         'device': device,
         'search_epochs': args.search_epochs,
