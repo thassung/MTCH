@@ -124,6 +124,24 @@ code(
 "def make_predictor(hid=HIDDEN_CHANNELS, n_layers=NUM_LAYERS, dropout=DROPOUT):\n"
 "    return LinkPredictor(hid, hid, 1, n_layers, dropout)\n"
 "\n"
+"def ensure_train_only_edges(data, dd):\n"
+"    \"\"\"Point data.edge_index at the train-only edge set (idempotent).\n"
+"\n"
+"    `prepare_link_prediction_data` returns a PyG Data whose edge_index contains\n"
+"    all positives (train + val + test). Extracting a subgraph around a val/test\n"
+"    edge (u, v) with the full graph would trivially include (u, v) itself and\n"
+"    leak the target into message passing (classic signature: SAGE val_mrr ~ 1.0).\n"
+"    Every downstream method (Full Graph, Static PPR, k-hop, Learnable PPR)\n"
+"    should call this first. Safe to call multiple times.\n"
+"    \"\"\"\n"
+"    if not getattr(data, '_edge_index_train_only', False):\n"
+"        data._orig_edge_index = data.edge_index\n"
+"        data.edge_index = dd['train_edge_index']\n"
+"        data._edge_index_train_only = True\n"
+"        print(f'  [train-only edges] swapped: '\n"
+"              f\"{data._orig_edge_index.size(1):,} -> {data.edge_index.size(1):,}\")\n"
+"    return data\n"
+"\n"
 "def save_full_results(base_dir, result_dict):\n"
 "    \"\"\"Save full_results.json inside a timestamped run directory.\n"
 "    Layout: base_dir/runs/{timestamp}/full_results.json\n"
@@ -167,6 +185,27 @@ code(
 "          f'Test: {se[\"test\"][\"source_node\"].size(0):,}')"
 )
 
+# ── Train-only message-passing graph (fix val/test leakage) ───────────────────
+md(
+"## 1.5. Use Train-Only Edges for Message Passing (optional pre-swap)\n"
+"\n"
+"`data.edge_index` from `prepare_link_prediction_data` contains **all** positive edges "
+"(train + val + test). Extracting a subgraph around a val/test edge `(u, v)` using "
+"this full graph would include `(u, v)` itself and leak the target into message "
+"passing (classic symptom: SAGE val_mrr ≈ 1.0 within 5 epochs).\n"
+"\n"
+"This cell pre-swaps every dataset to train-only edges. **It is optional** — each "
+"method section below also calls `ensure_train_only_edges(...)` at its own start, so "
+"you can skip any section (e.g. run 1 → 1.5 → 3, or even 1 → 3) and still be safe. "
+"The swap is idempotent."
+)
+
+code(
+"for ds_name in DATASETS:\n"
+"    print(f'[{ds_name}]')\n"
+"    ensure_train_only_edges(datasets[ds_name]['data'], datasets[ds_name])"
+)
+
 # ── Full Graph ────────────────────────────────────────────────────────────────
 md("## 2. Full Graph (No Subgraph)")
 
@@ -178,8 +217,7 @@ code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
 "    data = dd['data']\n"
-"    orig_edge_index = data.edge_index.clone()\n"
-"    data.edge_index = dd['train_edge_index']\n"
+"    ensure_train_only_edges(data, dd)   # no-op if Section 1.5 already ran\n"
 "    split_edge = dd['split_edge']\n"
 "\n"
 "    for enc_type in ENCODERS:\n"
@@ -220,10 +258,7 @@ code(
 "            })\n"
 "\n"
 "        del encoder, predictor, result\n"
-"        torch.cuda.empty_cache()\n"
-"\n"
-"    data.edge_index = orig_edge_index\n"
-"    del orig_edge_index"
+"        torch.cuda.empty_cache()"
 )
 
 code(
@@ -246,6 +281,7 @@ code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
 "    data = dd['data']; split_edge = dd['split_edge']\n"
+"    ensure_train_only_edges(data, dd)   # no-op if already swapped\n"
 "\n"
 "    for ppr_alpha in PPR_ALPHAS:\n"
 "        for ppr_eps in PPR_EPSILONS:\n"
@@ -332,6 +368,7 @@ code(
 "for ds_name in DATASETS:\n"
 "    dd = datasets[ds_name]\n"
 "    data = dd['data']; split_edge = dd['split_edge']\n"
+"    ensure_train_only_edges(data, dd)   # no-op if already swapped\n"
 "\n"
 "    for k in K_VALUES:\n"
 "        khop_pre = load_or_create_khop_preprocessor(ds_name, data, k)\n"
