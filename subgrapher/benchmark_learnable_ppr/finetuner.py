@@ -301,9 +301,13 @@ def _forward_micro_batch(encoder, predictor, subgraph_list, u_subs, v_subs,
 
     u_indices = offsets + torch.tensor(u_subs, dtype=torch.long, device=device)
     v_indices = offsets + torch.tensor(v_subs, dtype=torch.long, device=device)
-    neg_local = torch.stack([
-        torch.randint(0, nn, (1,)) for nn in num_nodes_list
-    ]).squeeze(1).to(device)
+    # Sample negative excluding v (the positive target) — vectorized.
+    v_subs_t = torch.tensor(v_subs, dtype=torch.long, device=device)
+    nn_excl = (nn_t - 1).clamp(min=1)
+    neg_local = (torch.rand(B, device=device) * nn_excl.float()).long()
+    neg_local = neg_local.clamp(max=nn_t - 2).clamp(min=0)
+    neg_local = torch.where(neg_local >= v_subs_t, neg_local + 1, neg_local)
+    neg_local = neg_local.clamp_(max=nn_t - 1)
     neg_indices = offsets + neg_local
 
     pos_out = predictor(h[u_indices], h[v_indices])
@@ -455,7 +459,7 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
         alpha = [0.5]
     if val_config_indices is None:
         val_config_indices = config_indices
-    from .evaluator import evaluate_learnable_ppr
+    from .evaluator import evaluate_learnable_ppr_fullgraph
 
     encoder = encoder.to(device)
     predictor = predictor.to(device)
@@ -534,13 +538,9 @@ def finetune_on_subgraphs(encoder, predictor, data, split_edge,
                 f'Fine-tuning epoch {epoch}/{epochs}, loss={loss:.4f}')
 
         if epoch % eval_steps == 0 or epoch == epochs:
-            val_results = evaluate_learnable_ppr(
+            val_results = evaluate_learnable_ppr_fullgraph(
                 encoder, predictor, data, split_edge,
-                multi_scale_ppr, val_config_indices,
-                split='valid', alpha=alpha,
-                epsilon=epsilon, window=window,
-                batch_size=batch_size, device=device,
-                cache_dir=cache_dir)
+                split='valid', device=device)
             history['val_results'].append(val_results)
 
             mrr = val_results['mrr']
