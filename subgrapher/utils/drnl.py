@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """DRNL (Double Radius Node Labeling) features for subgraph link prediction.
 
 Mirrors the labeling scheme from LCILP / SEAL:
