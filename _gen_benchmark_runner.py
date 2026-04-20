@@ -357,6 +357,7 @@ code(
 )
 
 code(
+"import gc\n"
 "gc.collect()\n"
 "torch.cuda.empty_cache()\n"
 "print('Static PPR done — GPU memory released.')"
@@ -441,6 +442,7 @@ code(
 )
 
 code(
+"import gc\n"
 "gc.collect()\n"
 "torch.cuda.empty_cache()\n"
 "print('Static k-hop done — GPU memory released.')"
