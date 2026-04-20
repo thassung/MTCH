@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.subgraph_csr import SubgraphCSR
+from ..utils.drnl import compute_drnl_for_batch
 
 
 def _build_pair_csr_cache(all_u: torch.Tensor, all_v: torch.Tensor,
@@ -134,6 +135,114 @@ def evaluate_ppr(encoder, predictor, data, split_edge, ppr_extractor,
 
         h = encoder(batch['x'], batch['edge_index'])
         s = predictor(h[batch['u_idx']], h[batch['v_idx']]).view(-1)
+        all_scores[batch['valid_idx']] = s.to(all_scores.dtype)
+
+    all_scores = torch.nan_to_num(all_scores, nan=0.0).cpu()
+    score_mat = all_scores.view(N, K + 1)
+    pos_scores = score_mat[:, 0]
+    neg_scores = score_mat[:, 1:]
+
+    return compute_metrics(pos_scores, neg_scores, list(K_values))
+
+
+@torch.no_grad()
+def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
+                        split='valid', batch_size=1024, device='cpu',
+                        K_values=(1, 3, 10, 50, 100),
+                        max_edges=None, num_negs_per_pos=None,
+                        cache_dir=None, verbose=True,
+                        drnl_max_dist=6):
+    """Evaluate SubgraphClassifier (LCILP-style) on a given split.
+
+    Uses DRNL node features and graph-level scoring — no full-graph encoder.
+    Reuses the same pair CSR cache as evaluate_ppr.
+    """
+    classifier.eval()
+
+    source = split_edge[split]['source_node']
+    target = split_edge[split]['target_node']
+    target_neg = split_edge[split]['target_node_neg']
+
+    N_total = source.size(0)
+    K_total = target_neg.size(1)
+
+    if max_edges is not None and max_edges < N_total:
+        gen = torch.Generator().manual_seed(0)
+        pos_perm = torch.randperm(N_total, generator=gen)[:max_edges]
+        source = source[pos_perm]
+        target = target[pos_perm]
+        target_neg = target_neg[pos_perm]
+        N = int(max_edges)
+    else:
+        N = N_total
+
+    if num_negs_per_pos is not None and num_negs_per_pos < K_total:
+        neg_perm = torch.randperm(K_total)[:num_negs_per_pos]
+        target_neg = target_neg[:, neg_perm]
+        K = int(num_negs_per_pos)
+    else:
+        K = K_total
+
+    all_u = source.unsqueeze(1).expand(N, K + 1).reshape(-1).contiguous()
+    all_v_mat = torch.cat([target.unsqueeze(1), target_neg], dim=1)
+    all_v = all_v_mat.reshape(-1).contiguous()
+    M = int(all_u.size(0))
+
+    if cache_dir is not None:
+        suffix = f'_me{max_edges}' if max_edges is not None else ''
+        suffix += f'_nk{num_negs_per_pos}' if num_negs_per_pos is not None else ''
+        path = os.path.join(cache_dir, f'{split}_pair_csr{suffix}.pt')
+        use_disk = True
+    else:
+        use_disk = False
+        path = None
+
+    if use_disk:
+        if os.path.isfile(path):
+            if verbose:
+                print(f'[EvalCache] Loading {split} pair CSR from {path}')
+            cache = SubgraphCSR.load(path)
+        else:
+            cache = _build_pair_csr_cache(
+                all_u, all_v, data, ppr_extractor,
+                progress_desc=f'Building {split} pair CSR', verbose=verbose,
+            )
+            os.makedirs(cache_dir, exist_ok=True)
+            cache.save(path)
+            if verbose:
+                mb = os.path.getsize(path) / 1e6
+                print(f'[EvalCache] Saved: {path} ({mb:.0f} MB)')
+    else:
+        cache = _build_pair_csr_cache(
+            all_u, all_v, data, ppr_extractor,
+            progress_desc=f'Building {split} pair CSR (ephemeral)',
+            verbose=verbose,
+        )
+
+    cache = cache.to(device)
+    x_dummy = torch.zeros(1, 1, device=device)
+
+    all_scores = torch.full((M,), float('nan'), device=device)
+
+    iterator = DataLoader(torch.arange(M).tolist(), batch_size, shuffle=False)
+    if verbose:
+        iterator = tqdm(iterator, desc=f'Eval {split}',
+                        leave=False, mininterval=30)
+
+    for perm in iterator:
+        idx = torch.as_tensor(perm, dtype=torch.long, device=device)
+        batch = cache.make_batch(idx, x_dummy)
+
+        B = int(batch['u_idx'].size(0))
+        if B == 0 or batch['total_edges'] == 0:
+            continue
+
+        x = compute_drnl_for_batch(batch, max_dist=drnl_max_dist)
+        batch_vec = torch.repeat_interleave(
+            torch.arange(B, device=device), batch['num_nodes_vec'])
+
+        s = classifier(x, batch['edge_index'], batch_vec,
+                       batch['u_idx'], batch['v_idx'])
         all_scores[batch['valid_idx']] = s.to(all_scores.dtype)
 
     all_scores = torch.nan_to_num(all_scores, nan=0.0).cpu()

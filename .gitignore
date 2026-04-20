@@ -4,6 +4,7 @@ tester.*
 .venv
 .env
 .vscode
+.*
 
 *.pyc
 
