@@ -78,14 +78,12 @@ def approximate_ppr(adj_csr, seed_set, alpha=0.85, epsilon=1e-3):
         neighbors = adj_csr.indices[start:end]
         weights = adj_csr.data[start:end]
 
-        for j in range(len(neighbors)):
-            neighbor = neighbors[j]
-            w = weights[j]
-            old_res = res[neighbor]
-            res[neighbor] += put_val * w / d
-            threshold = epsilon * degree[neighbor]
-            if res[neighbor] >= threshold > old_res:
-                next_nodes.appendleft(neighbor)
+        old_res_nbrs = res[neighbors].copy()
+        res[neighbors] += put_val * weights / d
+        threshold_nbrs = epsilon * degree[neighbors]
+        crossed = (res[neighbors] >= threshold_nbrs) & (old_res_nbrs < threshold_nbrs)
+        for neighbor in neighbors[crossed]:
+            next_nodes.appendleft(int(neighbor))
 
     return prob
 

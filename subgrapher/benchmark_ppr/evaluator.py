@@ -62,7 +62,8 @@ def evaluate_ppr(encoder, predictor, data, split_edge, ppr_extractor,
     K_total = target_neg.size(1)
 
     if max_edges is not None and max_edges < N_total:
-        pos_perm = torch.randperm(N_total)[:max_edges]
+        gen = torch.Generator().manual_seed(0)
+        pos_perm = torch.randperm(N_total, generator=gen)[:max_edges]
         source = source[pos_perm]
         target = target[pos_perm]
         target_neg = target_neg[pos_perm]
@@ -82,10 +83,15 @@ def evaluate_ppr(encoder, predictor, data, split_edge, ppr_extractor,
     all_v = all_v_mat.reshape(-1).contiguous()
     M = int(all_u.size(0))
 
-    use_disk = (cache_dir is not None
-                and max_edges is None and num_negs_per_pos is None)
+    if cache_dir is not None:
+        suffix = f'_me{max_edges}' if max_edges is not None else ''
+        suffix += f'_nk{num_negs_per_pos}' if num_negs_per_pos is not None else ''
+        path = os.path.join(cache_dir, f'{split}_pair_csr{suffix}.pt')
+        use_disk = True
+    else:
+        use_disk = False
+        path = None
     if use_disk:
-        path = os.path.join(cache_dir, f'{split}_pair_csr.pt')
         if os.path.isfile(path):
             if verbose:
                 print(f'[EvalCache] Loading {split} pair CSR from {path}')
