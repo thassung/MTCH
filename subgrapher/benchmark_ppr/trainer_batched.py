@@ -109,8 +109,14 @@ def train_epoch_ppr_csr(encoder, predictor, cache, x_full_gpu, optimizer,
         nn_b = batch["num_nodes_vec"]
         node_offsets = batch["batch_node_offsets"][:B]
 
-        nn_f = nn_b.to(torch.float32)
-        neg_local = (torch.rand(B, device=device) * nn_f).long()
+        # Sample negative excluding v (the positive target).
+        # Technique: sample from [0, num_nodes-2], then shift up past v's local
+        # position. For a 2-node subgraph this yields u as the only option.
+        v_sub_b = v_idx - node_offsets          # local pos of v in each subgraph
+        nn_excl_f = (nn_b - 1).clamp(min=1).to(torch.float32)
+        neg_local = (torch.rand(B, device=device) * nn_excl_f).long()
+        neg_local = neg_local.clamp(max=nn_b - 2).clamp(min=0)
+        neg_local = torch.where(neg_local >= v_sub_b, neg_local + 1, neg_local)
         neg_local = neg_local.clamp_(max=nn_b - 1)
         neg_idx = node_offsets + neg_local
 
