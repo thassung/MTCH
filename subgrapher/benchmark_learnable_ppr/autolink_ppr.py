@@ -55,6 +55,15 @@ class AutoLinkPPR(nn.Module):
         else:
             pred_in = hidden_channels * 2
 
+        # LayerNorm on the combined cross-pair vector is REQUIRED for training
+        # to escape the degenerate 2 log 2 plateau: the raw element-wise
+        # product r_u * r_v (element-wise) of two D-dim embeddings has
+        # variance ~1/D^2 per component, which collapses pre-sigmoid logits
+        # to ~0, sigmoid to ~0.5, and BCE to 2 log 2. LayerNorm before the
+        # MLP restores unit variance per component so the predictor has
+        # something to learn on.
+        self.pre_mlp_norm = nn.LayerNorm(pred_in)
+
         self.lins = nn.ModuleList()
         self.lins.append(nn.Linear(pred_in, hidden_channels))
         for _ in range(lin_layers - 2):
@@ -65,17 +74,34 @@ class AutoLinkPPR(nn.Module):
 
     def reset_parameters(self):
         self.encoder.reset_parameters()
+        self.pre_mlp_norm.reset_parameters()
         for lin in self.lins:
             lin.reset_parameters()
 
     def forward(self, x, edge_index):
-        """Run GNN encoder on full graph -> L2-normalized node embeddings [N, D]."""
+        """Run GNN encoder on full graph -> node embeddings [N, D].
+
+        NOTE: the previous implementation applied ``F.normalize(h, dim=-1)``
+        here. That squashed every row to unit L2 norm, which combined with
+        the element-wise ``r_u * r_v`` cross-pair product produced tiny
+        representations of order 1/D (~0.004 for D=256). The predictor's
+        pre-sigmoid logits then stayed near zero, sigmoid locked at ~0.5,
+        BCE locked at 2 log 2 = 1.386 for every epoch, and the arch_net
+        gradient was ~1e-8 -- i.e. nothing was learning. Removing the
+        normalize lets the encoder learn its own scale (matches the
+        unnormalized setup used in the Full-Graph and Static-PPR baselines).
+        """
         h = self.encoder(x, edge_index)
-        h = F.normalize(h, dim=-1)
         return h
 
     def pred_pair(self, x):
-        """MLP link predictor on combined representation."""
+        """MLP link predictor on combined representation.
+
+        Applies LayerNorm first so that the MLP always sees unit-variance
+        inputs, regardless of whether ``x`` came in with tiny magnitude
+        (element-wise product of PPR-weighted embeddings) or a larger one.
+        """
+        x = self.pre_mlp_norm(x)
         for lin in self.lins[:-1]:
             x = lin(x)
             x = F.relu(x)

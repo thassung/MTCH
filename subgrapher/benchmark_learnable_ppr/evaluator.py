@@ -217,17 +217,23 @@ def evaluate_learnable_ppr(encoder, predictor, data, split_edge,
         pos_pred = predictor(h[u_sub].unsqueeze(0), h[v_sub].unsqueeze(0))
         pos_preds.append(pos_pred.item())
 
+        # Fallback embedding for out-of-subgraph negatives: mean of all node
+        # embeddings in this subgraph, scored through the predictor. This
+        # avoids the pathological 0.1 constant floor that produced bimodal
+        # rank distributions (h@3 == h@10 == h@100) and inflated MRR.
+        mean_h = h.mean(dim=0, keepdim=True)
+        h_u_row = h[u_sub].unsqueeze(0)
+
         neg_pred_list = []
         for v_neg in v_negs:
             v_neg_item = v_neg.item()
             node_mask = (selected_nodes == v_neg_item)
             if node_mask.any():
                 v_neg_sub = node_mask.nonzero(as_tuple=True)[0][0]
-                neg_pred = predictor(h[u_sub].unsqueeze(0),
-                                     h[v_neg_sub].unsqueeze(0))
-                neg_pred_list.append(neg_pred.item())
+                neg_pred = predictor(h_u_row, h[v_neg_sub].unsqueeze(0))
             else:
-                neg_pred_list.append(0.1)
+                neg_pred = predictor(h_u_row, mean_h)
+            neg_pred_list.append(neg_pred.item())
         neg_preds.append(neg_pred_list)
 
         del h, sub_data

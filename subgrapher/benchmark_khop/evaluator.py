@@ -1,124 +1,97 @@
 """
-Evaluation metrics for k-hop subgraph link prediction.
-Modified from benchmark/evaluator.py to extract subgraphs before encoding.
+Evaluation for k-hop subgraph link prediction.
+
+Fixed version: scores every (u, v) pair (positive AND each negative) with a
+fresh subgraph extraction around that pair. NO hardcoded `0.1` floor for
+out-of-subgraph negatives (that floor created a bimodal rank distribution
+with `Hits@3 == Hits@10 == Hits@50 == Hits@100` which inflated MRR toward
+1.0 across the whole Static-PPR and k-hop sweep).
+
+Uses the CSR subgraph cache and vectorised batch construction so that the
+per-pair work is dominated by GPU forward passes, not Python.
 """
 
+from __future__ import annotations
+
 import os
-import torch
+
 import numpy as np
+import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.utils.data import DataLoader
-from torch_geometric.data import Data
 from torch_geometric.utils import subgraph as pyg_subgraph
 from tqdm import tqdm
 
-
-class KHopEvalCache:
-    """Pre-extracted subgraph topology for validation/test edges.
-
-    Stores selected_nodes, edge_index, u_sub, v_sub per positive edge.
-    Built once, reused every eval call within the same training run.
-    """
-
-    def __init__(self, selected_nodes, edge_index, u_sub, v_sub, num_nodes):
-        self.selected_nodes = selected_nodes
-        self.edge_index = edge_index
-        self.u_sub = u_sub
-        self.v_sub = v_sub
-        self.num_nodes = num_nodes
-
-    def __len__(self):
-        return len(self.selected_nodes)
-
-    @classmethod
-    def build(cls, source, target, data, khop_extractor, verbose=True):
-        n = source.size(0)
-        sel_list, ei_list, u_list, v_list, nn_list = [], [], [], [], []
-
-        it = tqdm(range(n), desc='Building eval cache', leave=False,
-                  mininterval=10) if verbose else range(n)
-        for i in it:
-            u = source[i].item()
-            v = target[i].item()
-
-            nodes_u = khop_extractor.preprocessor.get_khop_nodes(u)
-            nodes_v = khop_extractor.preprocessor.get_khop_nodes(v)
-            selected_nodes = torch.unique(torch.cat([nodes_u, nodes_v]))
-
-            edge_index_sub, _ = pyg_subgraph(
-                selected_nodes, data.edge_index,
-                relabel_nodes=True, num_nodes=data.num_nodes)
-
-            node_mapping = {node.item(): new_idx for new_idx, node in enumerate(selected_nodes)}
-            u_sub = node_mapping.get(u, -1)
-            v_sub = node_mapping.get(v, -1)
-
-            sel_list.append(selected_nodes.cpu())
-            ei_list.append(edge_index_sub.cpu())
-            u_list.append(u_sub)
-            v_list.append(v_sub)
-            nn_list.append(len(selected_nodes))
-
-        return cls(sel_list, ei_list, u_list, v_list, nn_list)
-
-    def save(self, path):
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        torch.save({
-            'selected_nodes': self.selected_nodes,
-            'edge_index': self.edge_index,
-            'u_sub': self.u_sub, 'v_sub': self.v_sub,
-            'num_nodes': self.num_nodes,
-        }, path)
-
-    @classmethod
-    def load(cls, path):
-        d = torch.load(path, map_location='cpu', weights_only=False)
-        return cls(d['selected_nodes'], d['edge_index'],
-                   d['u_sub'], d['v_sub'], d['num_nodes'])
-
-    def make_data(self, idx, x_full):
-        sel = self.selected_nodes[idx]
-        if len(sel) == 0:
-            return None, -1, -1, sel
-        x_sub = x_full[sel]
-        return (Data(x=x_sub, edge_index=self.edge_index[idx],
-                     num_nodes=self.num_nodes[idx]),
-                self.u_sub[idx], self.v_sub[idx], sel)
+from ..utils.subgraph_csr import SubgraphCSR
 
 
-def build_or_load_eval_cache(source, target, data, khop_extractor,
-                              cache_dir=None, split='valid', verbose=True):
-    if cache_dir:
-        path = os.path.join(cache_dir, f'{split}_subgraphs.pt')
-        if os.path.isfile(path):
-            if verbose:
-                print(f'[EvalCache] Loading {split} subgraphs from {path}')
-            return KHopEvalCache.load(path)
+# ---------------------------------------------------------------------------
+# Pair CSR cache (one entry per (u, v) pair being scored)
+# ---------------------------------------------------------------------------
 
-    if verbose:
-        print(f'[EvalCache] Extracting {split} subgraphs (one-time cost)...')
-    cache = KHopEvalCache.build(source, target, data, khop_extractor, verbose)
 
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-        path = os.path.join(cache_dir, f'{split}_subgraphs.pt')
-        cache.save(path)
-        mb = os.path.getsize(path) / 1e6
-        if verbose:
-            print(f'[EvalCache] Saved: {path} ({mb:.0f} MB)')
-    return cache
+def _build_pair_csr_cache(all_u: torch.Tensor, all_v: torch.Tensor,
+                          data, khop_extractor,
+                          progress_desc='Building eval CSR',
+                          verbose=True) -> SubgraphCSR:
+    """One CSR entry per (u, v) pair; subgraph is k-hop(u) U k-hop(v)."""
+    edge_index_full = data.edge_index
+    num_nodes_full = data.num_nodes
+    preproc = khop_extractor.preprocessor
+
+    def extract(i: int):
+        u = int(all_u[i].item())
+        v = int(all_v[i].item())
+
+        nodes_u = preproc.get_khop_nodes(u)
+        nodes_v = preproc.get_khop_nodes(v)
+        selected_nodes = torch.unique(torch.cat([nodes_u, nodes_v]))
+
+        ei_sub, _ = pyg_subgraph(
+            selected_nodes, edge_index_full,
+            relabel_nodes=True, num_nodes=num_nodes_full,
+        )
+
+        pos_u = torch.searchsorted(selected_nodes, torch.tensor([u]))[0].item()
+        pos_v = torch.searchsorted(selected_nodes, torch.tensor([v]))[0].item()
+        if pos_u >= selected_nodes.numel() or selected_nodes[pos_u].item() != u:
+            return None
+        if pos_v >= selected_nodes.numel() or selected_nodes[pos_v].item() != v:
+            return None
+
+        return selected_nodes, ei_sub, pos_u, pos_v
+
+    return SubgraphCSR.build(
+        num_edges=int(all_u.size(0)),
+        extract_fn=extract,
+        progress_desc=progress_desc,
+        verbose=verbose,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main evaluator
+# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
 def evaluate_khop(encoder, predictor, data, split_edge, khop_extractor,
-                  split='valid', batch_size=65536, device='cpu',
-                  K_values=[1, 3, 10, 50, 100], max_edges=None,
-                  eval_cache=None, cache_dir=None):
+                  split='valid', batch_size=1024, device='cpu',
+                  K_values=(1, 3, 10, 50, 100),
+                  max_edges=None, num_negs_per_pos=None,
+                  cache_dir=None, x_full_gpu=None,
+                  verbose=True):
     """
-    Evaluation with k-hop subgraph extraction.
-    Pass eval_cache (KHopEvalCache) to skip redundant subgraph extraction.
-    Pass cache_dir to auto-build and persist the eval cache to disk.
-    Set max_edges to subsample for fast validation during training.
+    Score every (u, v_pos) and (u, v_neg_k) pair by extracting a fresh k-hop
+    subgraph for each pair. Returns standard metrics.
+
+    Args:
+        split: 'valid' or 'test'
+        batch_size: number of pairs per GNN forward
+        max_edges: subsample this many positive edges (default: all)
+        num_negs_per_pos: subsample this many negatives per positive
+            (default: use all in split_edge['{split}']['target_node_neg'])
+        cache_dir: dir to persist the eval CSR cache (disabled when subsampling)
     """
     encoder.eval()
     predictor.eval()
@@ -127,78 +100,92 @@ def evaluate_khop(encoder, predictor, data, split_edge, khop_extractor,
     target = split_edge[split]['target_node']
     target_neg = split_edge[split]['target_node_neg']
 
-    num_pos_edges = source.size(0)
-    num_neg_per_pos = target_neg.size(1)
+    N_total = source.size(0)
+    K_total = target_neg.size(1)
 
-    if max_edges and max_edges < num_pos_edges:
-        perm = torch.randperm(num_pos_edges)[:max_edges]
-        source = source[perm]
-        target = target[perm]
-        target_neg = target_neg[perm]
-        num_pos_edges = max_edges
-        use_cache = False
+    if max_edges is not None and max_edges < N_total:
+        pos_perm = torch.randperm(N_total)[:max_edges]
+        source = source[pos_perm]
+        target = target[pos_perm]
+        target_neg = target_neg[pos_perm]
+        N = int(max_edges)
     else:
-        use_cache = True
+        N = N_total
 
-    if use_cache and eval_cache is None and cache_dir:
-        eval_cache = build_or_load_eval_cache(
-            source, target, data, khop_extractor,
-            cache_dir=cache_dir, split=split, verbose=True)
+    if num_negs_per_pos is not None and num_negs_per_pos < K_total:
+        neg_perm = torch.randperm(K_total)[:num_negs_per_pos]
+        target_neg = target_neg[:, neg_perm]
+        K = int(num_negs_per_pos)
+    else:
+        K = K_total
 
-    pos_preds = []
-    neg_preds = []
+    all_u = source.unsqueeze(1).expand(N, K + 1).reshape(-1).contiguous()
+    all_v_mat = torch.cat([target.unsqueeze(1), target_neg], dim=1)
+    all_v = all_v_mat.reshape(-1).contiguous()
+    M = int(all_u.size(0))
 
-    for idx in tqdm(range(num_pos_edges), desc=f'Eval {split}',
-                    leave=False, mininterval=30):
-        u = source[idx].item()
-        v_negs = target_neg[idx]
-
-        if use_cache and eval_cache is not None:
-            sub_data, u_sub, v_sub, selected_nodes = eval_cache.make_data(idx, data.x)
-            if sub_data is None:
-                pos_preds.append(0.5)
-                neg_preds.append([0.5] * num_neg_per_pos)
-                continue
-            sub_data = sub_data.to(device)
+    use_disk = (cache_dir is not None
+                and max_edges is None and num_negs_per_pos is None)
+    if use_disk:
+        path = os.path.join(cache_dir, f'{split}_pair_csr.pt')
+        if os.path.isfile(path):
+            if verbose:
+                print(f'[EvalCache] Loading {split} pair CSR from {path}')
+            cache = SubgraphCSR.load(path)
         else:
-            v_pos = target[idx].item()
-            subgraph_data, selected_nodes, metadata = khop_extractor.extract_subgraph(u, v_pos)
-            sub_data = subgraph_data.to(device)
-            u_sub = metadata['u_subgraph']
-            v_sub = metadata['v_subgraph']
-            if u_sub == -1 or v_sub == -1:
-                pos_preds.append(0.5)
-                neg_preds.append([0.5] * num_neg_per_pos)
-                del sub_data
-                continue
+            cache = _build_pair_csr_cache(
+                all_u, all_v, data, khop_extractor,
+                progress_desc=f'Building {split} pair CSR', verbose=verbose,
+            )
+            os.makedirs(cache_dir, exist_ok=True)
+            cache.save(path)
+            if verbose:
+                mb = os.path.getsize(path) / 1e6
+                print(f'[EvalCache] Saved: {path} ({mb:.0f} MB)')
+    else:
+        cache = _build_pair_csr_cache(
+            all_u, all_v, data, khop_extractor,
+            progress_desc=f'Building {split} pair CSR (ephemeral)',
+            verbose=verbose,
+        )
 
-        h = encoder(sub_data.x, sub_data.edge_index)
+    cache = cache.to(device)
+    if x_full_gpu is None:
+        x_full_gpu = data.x.to(device)
 
-        pos_pred = predictor(h[u_sub].unsqueeze(0), h[v_sub].unsqueeze(0))
-        pos_preds.append(pos_pred.item())
+    all_scores = torch.full((M,), float('nan'), device=device)
 
-        neg_pred_list = []
-        for v_neg in v_negs:
-            v_neg_item = v_neg.item()
-            node_mask = (selected_nodes == v_neg_item)
-            if node_mask.any():
-                v_neg_sub = node_mask.nonzero(as_tuple=True)[0][0]
-                neg_pred = predictor(h[u_sub].unsqueeze(0), h[v_neg_sub].unsqueeze(0))
-                neg_pred_list.append(neg_pred.item())
-            else:
-                neg_pred_list.append(0.1)
+    iterator = DataLoader(torch.arange(M).tolist(), batch_size, shuffle=False)
+    if verbose:
+        iterator = tqdm(iterator, desc=f'Eval {split}',
+                        leave=False, mininterval=30)
 
-        neg_preds.append(neg_pred_list)
-        del h, sub_data
+    for perm in iterator:
+        idx = torch.as_tensor(perm, dtype=torch.long, device=device)
+        batch = cache.make_batch(idx, x_full_gpu)
 
-    pos_preds = torch.tensor(pos_preds)
-    neg_preds = torch.tensor(neg_preds)
+        B = int(batch['u_idx'].size(0))
+        if B == 0:
+            continue
 
-    results = compute_metrics(pos_preds, neg_preds, K_values)
-    return results
+        h = encoder(batch['x'], batch['edge_index'])
+        s = predictor(h[batch['u_idx']], h[batch['v_idx']]).view(-1)
+        all_scores[batch['valid_idx']] = s.to(all_scores.dtype)
+
+    all_scores = torch.nan_to_num(all_scores, nan=0.0).cpu()
+    score_mat = all_scores.view(N, K + 1)
+    pos_scores = score_mat[:, 0]
+    neg_scores = score_mat[:, 1:]
+
+    return compute_metrics(pos_scores, neg_scores, list(K_values))
 
 
-def compute_metrics(pos_pred, neg_pred, K_values=[1, 3, 10, 50, 100]):
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+def compute_metrics(pos_pred, neg_pred, K_values=(1, 3, 10, 50, 100)) -> dict:
     mrr = compute_mrr(pos_pred, neg_pred)
     hits = {}
     for k in K_values:
@@ -219,11 +206,10 @@ def compute_hits_at_k(pos_pred, neg_pred, k):
 
 
 def compute_auc_ap(pos_pred, neg_pred):
-    pos_pred_flat = pos_pred.numpy()
-    neg_pred_flat = neg_pred.numpy().flatten()
-    y_true = np.concatenate([np.ones(len(pos_pred_flat)),
-                             np.zeros(len(neg_pred_flat))])
-    y_pred = np.concatenate([pos_pred_flat, neg_pred_flat])
+    pos_flat = pos_pred.numpy()
+    neg_flat = neg_pred.numpy().flatten()
+    y_true = np.concatenate([np.ones(len(pos_flat)), np.zeros(len(neg_flat))])
+    y_pred = np.concatenate([pos_flat, neg_flat])
     auc = roc_auc_score(y_true, y_pred)
     ap = average_precision_score(y_true, y_pred)
     return auc, ap
