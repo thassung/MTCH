@@ -105,6 +105,23 @@ def generate_negative_samples(pos_edge_index, num_nodes, num_neg_samples=None):
     return neg_edge_index
 
 
+def _ensure_planetoid_raw(name, root):
+    """Pre-download Planetoid raw files using urllib (bypasses aiohttp issues)."""
+    import urllib.request
+    raw_dir = os.path.join(root, name, 'raw')
+    os.makedirs(raw_dir, exist_ok=True)
+    base_url = 'https://github.com/kimiyoung/planetoid/raw/master/data'
+    endings = ['x', 'tx', 'allx', 'y', 'ty', 'ally', 'graph', 'test.index']
+    for ending in endings:
+        fname = f'ind.{name.lower()}.{ending}'
+        fpath = os.path.join(raw_dir, fname)
+        if not os.path.exists(fpath):
+            url = f'{base_url}/{fname}'
+            print(f'  Downloading {fname}...', end=' ', flush=True)
+            urllib.request.urlretrieve(url, fpath)
+            print('done')
+
+
 def prepare_planetoid_data(name, root='data/planetoid', val_ratio=0.1, test_ratio=0.1,
                            num_neg_samples_eval=100, seed=42):
     """Prepare Cora / CiteSeer / PubMed for link prediction.
@@ -117,6 +134,7 @@ def prepare_planetoid_data(name, root='data/planetoid', val_ratio=0.1, test_rati
     from torch_geometric.utils import remove_self_loops
 
     print(f"Loading {name} from PyG Planetoid...")
+    _ensure_planetoid_raw(name, root)
     dataset = Planetoid(root=root, name=name)
     data = dataset[0].clone()
     data.edge_index, _ = remove_self_loops(data.edge_index)
