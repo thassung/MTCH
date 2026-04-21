@@ -116,7 +116,9 @@ def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
 
     # Dummy x_full — real features come from DRNL, this is just to satisfy
     # SubgraphCSR.make_batch's signature (the returned x is discarded).
-    x_dummy = torch.zeros(1, 1, device=device)
+    # Must be large enough to index by global node ID without OOB.
+    n_nodes = int(pos_cache.node_ids.max().item()) + 1
+    x_dummy = torch.zeros(n_nodes, 1, device=device)
 
     total_loss, total_examples = 0.0, 0
 

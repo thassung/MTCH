@@ -220,7 +220,7 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
         )
 
     cache = cache.to(device)
-    x_dummy = torch.zeros(1, 1, device=device)
+    x_dummy = torch.zeros(data.num_nodes, 1, device=device)
 
     all_scores = torch.full((M,), float('nan'), device=device)
 
