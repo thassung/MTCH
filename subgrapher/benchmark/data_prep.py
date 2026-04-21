@@ -105,6 +105,68 @@ def generate_negative_samples(pos_edge_index, num_nodes, num_neg_samples=None):
     return neg_edge_index
 
 
+def prepare_planetoid_data(name, root='data/planetoid', val_ratio=0.1, test_ratio=0.1,
+                           num_neg_samples_eval=100, seed=42):
+    """Prepare Cora / CiteSeer / PubMed for link prediction.
+
+    Uses the dataset's real node features (no random embeddings needed).
+    Applies the same split_edges + negative sampling logic as prepare_link_prediction_data
+    so the rest of the pipeline is unchanged.
+    """
+    from torch_geometric.datasets import Planetoid
+    from torch_geometric.utils import remove_self_loops
+
+    print(f"Loading {name} from PyG Planetoid...")
+    dataset = Planetoid(root=root, name=name)
+    data = dataset[0].clone()
+    data.edge_index, _ = remove_self_loops(data.edge_index)
+    data.edge_index = to_undirected(data.edge_index, num_nodes=data.num_nodes)
+
+    feature_dim = int(data.x.size(1))
+    print(f"  Nodes: {data.num_nodes}  Edges: {data.edge_index.size(1)}  "
+          f"Features: {feature_dim}")
+
+    torch.manual_seed(seed)
+    edge_splits = split_edges(data.edge_index, data.num_nodes, val_ratio, test_ratio)
+
+    val_neg = generate_negative_samples(
+        edge_splits['val'], data.num_nodes,
+        num_neg_samples=edge_splits['val'].size(1) * num_neg_samples_eval)
+    test_neg = generate_negative_samples(
+        edge_splits['test'], data.num_nodes,
+        num_neg_samples=edge_splits['test'].size(1) * num_neg_samples_eval)
+
+    split_edge = {
+        'train': {
+            'source_node': edge_splits['train'][0],
+            'target_node': edge_splits['train'][1],
+        },
+        'valid': {
+            'source_node': edge_splits['val'][0],
+            'target_node': edge_splits['val'][1],
+            'target_node_neg': val_neg[1].view(edge_splits['val'].size(1), -1),
+        },
+        'test': {
+            'source_node': edge_splits['test'][0],
+            'target_node': edge_splits['test'][1],
+            'target_node_neg': test_neg[1].view(edge_splits['test'].size(1), -1),
+        },
+    }
+
+    print(f"  Train: {edge_splits['train'].size(1):,}  "
+          f"Val: {edge_splits['val'].size(1):,}  "
+          f"Test: {edge_splits['test'].size(1):,}")
+
+    return {
+        'data': data,
+        'split_edge': split_edge,
+        'train_edge_index': edge_splits['train'],
+        'feature_dim': feature_dim,
+        'node2idx': None,
+        'idx2node': None,
+    }
+
+
 def prepare_link_prediction_data(dataset_path, feature_method='random', feature_dim=128,
                                   val_ratio=0.1, test_ratio=0.1, num_neg_samples_eval=100):
     """
@@ -172,6 +234,7 @@ def prepare_link_prediction_data(dataset_path, feature_method='random', feature_
         'split_edge': split_edge,
         'node2idx': node2idx,
         'idx2node': idx2node,
-        'train_edge_index': edge_splits['train']
+        'train_edge_index': edge_splits['train'],
+        'feature_dim': feature_dim,
     }
 
