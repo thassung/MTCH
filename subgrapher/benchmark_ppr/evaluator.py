@@ -222,6 +222,22 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
     cache = cache.to(device)
     x_dummy = torch.zeros(data.num_nodes, 1, device=device)
 
+    # Pre-compute DRNL once for this eval cache if not already stored
+    if cache.drnl_feats is None:
+        from ..utils.drnl import compute_drnl_for_csr
+        if verbose:
+            print(f'[DRNL] Pre-computing DRNL for {split} eval cache '
+                  f'({int(cache.valid_mask.sum())} subgraphs)...')
+        cache = cache.to('cpu')
+        cache.drnl_feats = compute_drnl_for_csr(cache, max_dist=drnl_max_dist,
+                                                 verbose=verbose)
+        if use_disk:
+            cache.save(path)
+            if verbose:
+                mb = os.path.getsize(path) / 1e6
+                print(f'[DRNL] Saved eval cache with DRNL: {path} ({mb:.0f} MB)')
+        cache = cache.to(device)
+
     all_scores = torch.full((M,), float('nan'), device=device)
 
     iterator = DataLoader(torch.arange(M).tolist(), batch_size, shuffle=False)
@@ -237,7 +253,10 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
         if B == 0 or batch['total_edges'] == 0:
             continue
 
-        x = compute_drnl_for_batch(batch, max_dist=drnl_max_dist)
+        if batch['drnl_x'] is not None:
+            x = batch['drnl_x'].to(device)
+        else:
+            x = compute_drnl_for_batch(batch, max_dist=drnl_max_dist)
         batch_vec = torch.repeat_interleave(
             torch.arange(B, device=device), batch['num_nodes_vec'])
 

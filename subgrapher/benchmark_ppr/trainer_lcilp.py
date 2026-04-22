@@ -137,9 +137,13 @@ def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
         if B == 0 or pos_b["total_edges"] == 0:
             continue
 
-        # DRNL node features (replaces random x_full lookup)
-        pos_x = compute_drnl_for_batch(pos_b, max_dist=drnl_max_dist)
-        neg_x = compute_drnl_for_batch(neg_b, max_dist=drnl_max_dist)
+        # Use pre-computed DRNL if available (fast index), else compute on-the-fly
+        if pos_b["drnl_x"] is not None:
+            pos_x = pos_b["drnl_x"].to(device)
+            neg_x = neg_b["drnl_x"].to(device)
+        else:
+            pos_x = compute_drnl_for_batch(pos_b, max_dist=drnl_max_dist)
+            neg_x = compute_drnl_for_batch(neg_b, max_dist=drnl_max_dist)
 
         # batch assignment vector for global_mean_pool
         pos_bvec = torch.repeat_interleave(
@@ -210,6 +214,25 @@ def train_model_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
         num_nodes=data.num_nodes,
         cache_dir=cache_dir, seed=42, verbose=verbose,
     )
+
+    # --- pre-compute DRNL once (avoids Python BFS every training batch) ---
+    from ..utils.drnl import compute_drnl_for_csr
+    for tag, cache, fname in [
+        ("pos", pos_cache, "train_subgraphs_csr.pt"),
+        ("neg", neg_cache, "train_neg_subgraphs_csr.pt"),
+    ]:
+        if cache.drnl_feats is None:
+            if verbose:
+                print(f"[DRNL] Pre-computing DRNL for {tag} cache "
+                      f"({int(cache.valid_mask.sum())} subgraphs)...")
+            cache.drnl_feats = compute_drnl_for_csr(
+                cache, max_dist=drnl_max_dist, verbose=verbose)
+            if cache_dir:
+                path = os.path.join(cache_dir, fname)
+                cache.save(path)
+                if verbose:
+                    mb = os.path.getsize(path) / 1e6
+                    print(f"[DRNL] Saved {tag} cache with DRNL: {path} ({mb:.0f} MB)")
 
     pos_cache = pos_cache.to(device)
     neg_cache = neg_cache.to(device)

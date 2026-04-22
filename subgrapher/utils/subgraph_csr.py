@@ -25,8 +25,8 @@ valid_mask[i] is False.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 import torch
 
@@ -42,6 +42,10 @@ class SubgraphCSR:
     v_sub: torch.Tensor
     num_nodes: torch.Tensor
     valid_mask: torch.Tensor
+    # Optional pre-computed DRNL features [total_nodes, 2*(max_dist+1)].
+    # When present, make_batch returns them via fast index instead of
+    # computing BFS every forward pass.
+    drnl_feats: Optional[torch.Tensor] = None
 
     def __len__(self) -> int:
         return int(self.u_sub.size(0))
@@ -57,6 +61,7 @@ class SubgraphCSR:
             v_sub=self.v_sub.to(device),
             num_nodes=self.num_nodes.to(device),
             valid_mask=self.valid_mask.to(device),
+            drnl_feats=self.drnl_feats.to(device) if self.drnl_feats is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -151,21 +156,21 @@ class SubgraphCSR:
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save(
-            {
-                "format": "SubgraphCSR/v1",
-                "node_ids": self.node_ids,
-                "node_offs": self.node_offs,
-                "edge_src": self.edge_src,
-                "edge_dst": self.edge_dst,
-                "edge_offs": self.edge_offs,
-                "u_sub": self.u_sub,
-                "v_sub": self.v_sub,
-                "num_nodes": self.num_nodes,
-                "valid_mask": self.valid_mask,
-            },
-            path,
-        )
+        d = {
+            "format": "SubgraphCSR/v1",
+            "node_ids": self.node_ids,
+            "node_offs": self.node_offs,
+            "edge_src": self.edge_src,
+            "edge_dst": self.edge_dst,
+            "edge_offs": self.edge_offs,
+            "u_sub": self.u_sub,
+            "v_sub": self.v_sub,
+            "num_nodes": self.num_nodes,
+            "valid_mask": self.valid_mask,
+        }
+        if self.drnl_feats is not None:
+            d["drnl_feats"] = self.drnl_feats.cpu()
+        torch.save(d, path)
 
     @classmethod
     def load(cls, path: str) -> "SubgraphCSR":
@@ -182,6 +187,7 @@ class SubgraphCSR:
             v_sub=d["v_sub"],
             num_nodes=d["num_nodes"],
             valid_mask=d["valid_mask"],
+            drnl_feats=d.get("drnl_feats"),  # None for old caches
         )
 
     # ------------------------------------------------------------------
@@ -211,6 +217,7 @@ class SubgraphCSR:
                 "valid_idx": valid_idx,
                 "total_nodes": 0,
                 "total_edges": 0,
+                "drnl_x": None,
             }
 
         node_lo = self.node_offs[valid_idx]
@@ -260,6 +267,9 @@ class SubgraphCSR:
         u_idx_batch = batch_node_offsets[:B] + self.u_sub[valid_idx]
         v_idx_batch = batch_node_offsets[:B] + self.v_sub[valid_idx]
 
+        # If DRNL features are pre-computed, return them via fast index lookup.
+        drnl_batch = self.drnl_feats[node_gather] if self.drnl_feats is not None else None
+
         return {
             "x": x_batch,
             "edge_index": edge_index,
@@ -270,6 +280,7 @@ class SubgraphCSR:
             "valid_idx": valid_idx,
             "total_nodes": total_nodes,
             "total_edges": total_edges,
+            "drnl_x": drnl_batch,
         }
 
     def summary(self) -> dict:

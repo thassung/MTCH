@@ -32,6 +32,54 @@ def _bfs_dist(adj: list[list], source: int, n: int, max_dist: int) -> list[int]:
     return dist
 
 
+def compute_drnl_for_csr(csr, max_dist: int = 6, verbose: bool = True) -> torch.Tensor:
+    """Pre-compute DRNL for every subgraph in a SubgraphCSR. One-time cost.
+
+    Returns FloatTensor [total_nodes, 2*(max_dist+1)] aligned with csr.node_ids.
+    Store in csr.drnl_feats and save the cache — training then does a single
+    tensor index per batch instead of Python BFS on every forward pass.
+    """
+    from tqdm import tqdm
+
+    total_nodes = int(csr.node_ids.size(0))
+    dim = max_dist + 1
+    x = torch.zeros(total_nodes, 2 * dim)
+
+    N = int(csr.u_sub.size(0))
+    it = tqdm(range(N), desc='Pre-computing DRNL', leave=False,
+              mininterval=10) if verbose else range(N)
+
+    for i in it:
+        if not bool(csr.valid_mask[i].item()):
+            continue
+        n_start = int(csr.node_offs[i].item())
+        n_end   = int(csr.node_offs[i + 1].item())
+        e_start = int(csr.edge_offs[i].item())
+        e_end   = int(csr.edge_offs[i + 1].item())
+        n_i = n_end - n_start
+        if n_i == 0:
+            continue
+
+        adj: list[list] = [[] for _ in range(n_i)]
+        for e in range(e_start, e_end):
+            s = int(csr.edge_src[e].item())
+            d = int(csr.edge_dst[e].item())
+            if 0 <= s < n_i and 0 <= d < n_i:
+                adj[s].append(d)
+
+        u_loc = int(csr.u_sub[i].item())
+        v_loc = int(csr.v_sub[i].item())
+
+        d_u = _bfs_dist(adj, u_loc, n_i, max_dist)
+        d_v = _bfs_dist(adj, v_loc, n_i, max_dist)
+
+        for j in range(n_i):
+            x[n_start + j, d_u[j]] = 1.0
+            x[n_start + j, dim + d_v[j]] = 1.0
+
+    return x
+
+
 def compute_drnl_for_batch(batch: dict, max_dist: int = 6) -> torch.Tensor:
     """Compute DRNL features for every node in a SubgraphCSR mega-batch.
 
