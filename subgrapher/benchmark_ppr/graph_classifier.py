@@ -3,10 +3,11 @@
 Scores a subgraph by pooling node representations and concatenating
 head/tail embeddings — mirrors LCILP's GraphClassifier.
 
-  score(u, v | subgraph) = sigmoid(MLP([mean_pool(h) || h_u || h_v]))
+  score(u, v | subgraph) = MLP([mean_pool(h) || h_u || h_v])
 
-The input features are DRNL labels (from subgrapher.utils.drnl), not
-random node features, so the model learns purely from subgraph structure.
+Input features are DRNL structural labels concatenated with original node
+features (when feature_dim > 0), matching the PS2 setup for citation networks.
+Scores are raw unbounded logits — no sigmoid — for use with MarginRankingLoss.
 """
 
 import torch
@@ -22,26 +23,30 @@ class SubgraphClassifier(nn.Module):
     Parameters
     ----------
     drnl_dim : int
-        Input feature dimension = 2*(max_dist+1).
+        DRNL feature dimension = 2*(max_dist+1).
     hidden : int
         Hidden and output dimension of the GNN layers.
     num_layers : int
         Number of GNN layers.
     dropout : float
     encoder_type : str
-        'GCN' or 'SAGE'.
+        'GCN', 'SAGE', or 'GAT'.
+    feature_dim : int
+        Original node feature dimension to concatenate with DRNL (0 = DRNL only).
     """
 
     def __init__(self, drnl_dim: int, hidden: int, num_layers: int,
-                 dropout: float, encoder_type: str = "GCN"):
+                 dropout: float, encoder_type: str = "GCN", feature_dim: int = 0):
         super().__init__()
 
+        in_channels = drnl_dim + feature_dim
+
         if encoder_type == "SAGE":
-            self.encoder = SAGE(drnl_dim, hidden, hidden, num_layers, dropout)
+            self.encoder = SAGE(in_channels, hidden, hidden, num_layers, dropout)
         elif encoder_type == "GAT":
-            self.encoder = GAT(drnl_dim, hidden, hidden, num_layers, dropout, heads=4)
+            self.encoder = GAT(in_channels, hidden, hidden, num_layers, dropout, heads=4)
         else:
-            self.encoder = GCN(drnl_dim, hidden, hidden, num_layers, dropout)
+            self.encoder = GCN(in_channels, hidden, hidden, num_layers, dropout)
 
         self.mlp = nn.Sequential(
             nn.Linear(3 * hidden, hidden),
@@ -62,19 +67,19 @@ class SubgraphClassifier(nn.Module):
         """
         Parameters
         ----------
-        x          : [N, drnl_dim]  DRNL node features for the mega-batch
-        edge_index : [2, E]         mega-batch edge index
-        batch_vec  : [N]            batch assignment (node i belongs to graph batch_vec[i])
-        u_idx      : [B]            global indices of u nodes in the mega-batch
-        v_idx      : [B]            global indices of v nodes in the mega-batch
+        x          : [N, in_channels]  node features (DRNL or DRNL+content)
+        edge_index : [2, E]            mega-batch edge index
+        batch_vec  : [N]               batch assignment
+        u_idx      : [B]               indices of u nodes in mega-batch
+        v_idx      : [B]               indices of v nodes in mega-batch
 
         Returns
         -------
-        scores : [B] sigmoid scores in (0, 1)
+        scores : [B] unbounded logits (no sigmoid — use with MarginRankingLoss)
         """
         h = self.encoder(x, edge_index)               # [N, hidden]
         g = global_mean_pool(h, batch_vec)             # [B, hidden]
         hu = h[u_idx]                                  # [B, hidden]
         hv = h[v_idx]                                  # [B, hidden]
         logit = self.mlp(torch.cat([g, hu, hv], dim=1))  # [B, 1]
-        return torch.sigmoid(logit.squeeze(-1))        # [B]
+        return logit.squeeze(-1)                       # [B] unbounded

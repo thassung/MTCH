@@ -97,7 +97,7 @@ def build_or_load_neg_csr_cache(source_edge, target_edge, data, ppr_extractor,
 # ---------------------------------------------------------------------------
 
 def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
-                      batch_size, device, drnl_max_dist=6,
+                      batch_size, device, x_full=None, drnl_max_dist=6,
                       margin=10.0, grad_clip=1.0,
                       edges_per_epoch=None, verbose=False):
     classifier.train()
@@ -112,13 +112,12 @@ def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
     dataloader = DataLoader(indices.tolist(), batch_size, shuffle=False)
     if verbose:
         dataloader = tqdm(dataloader, desc="  Batches", leave=False,
-                          mininterval=30)
+                          mininterval=10)
 
-    # Dummy x_full — real features come from DRNL, this is just to satisfy
-    # SubgraphCSR.make_batch's signature (the returned x is discarded).
-    # Must be large enough to index by global node ID without OOB.
-    n_nodes = int(pos_cache.node_ids.max().item()) + 1
-    x_dummy = torch.zeros(n_nodes, 1, device=device)
+    # x_full used by make_batch for content features; fall back to zeros if None.
+    if x_full is None:
+        n_nodes = int(pos_cache.node_ids.max().item()) + 1
+        x_full = torch.zeros(n_nodes, 1, device=device)
 
     total_loss, total_examples = 0.0, 0
 
@@ -131,16 +130,18 @@ def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
         if both_idx.numel() == 0:
             continue
 
-        pos_b = pos_cache.make_batch(both_idx, x_dummy)
-        neg_b = neg_cache.make_batch(both_idx, x_dummy)
+        pos_b = pos_cache.make_batch(both_idx, x_full)
+        neg_b = neg_cache.make_batch(both_idx, x_full)
         B = int(pos_b["u_idx"].size(0))
         if B == 0 or pos_b["total_edges"] == 0:
             continue
 
-        # Use pre-computed DRNL if available (fast index), else compute on-the-fly
+        # Use pre-computed DRNL; concatenate with content features if present
         if pos_b["drnl_x"] is not None:
-            pos_x = pos_b["drnl_x"].to(device)
-            neg_x = neg_b["drnl_x"].to(device)
+            pos_x = torch.cat([pos_b["drnl_x"].to(device),
+                                pos_b["x"].to(device)], dim=-1)
+            neg_x = torch.cat([neg_b["drnl_x"].to(device),
+                                neg_b["x"].to(device)], dim=-1)
         else:
             pos_x = compute_drnl_for_batch(pos_b, max_dist=drnl_max_dist)
             neg_x = compute_drnl_for_batch(neg_b, max_dist=drnl_max_dist)
@@ -240,7 +241,7 @@ def train_model_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
     optimizer = torch.optim.Adam(
         classifier.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5)
+        optimizer, mode="max", factor=0.5, patience=10)
 
     history = {
         "train_loss": [], "val_results": [], "epoch_times": [],
@@ -263,6 +264,7 @@ def train_model_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
         loss = train_epoch_lcilp(
             classifier, pos_cache, neg_cache, optimizer,
             batch_size, device,
+            x_full=data.x.to(device) if data.x is not None else None,
             drnl_max_dist=drnl_max_dist, margin=margin,
             grad_clip=grad_clip, edges_per_epoch=edges_per_epoch,
             verbose=show_batch,

@@ -165,7 +165,7 @@ def evaluate_khop(encoder, predictor, data, split_edge, khop_extractor,
     iterator = DataLoader(torch.arange(M).tolist(), batch_size, shuffle=False)
     if verbose:
         iterator = tqdm(iterator, desc=f'Eval {split}',
-                        leave=False, mininterval=30)
+                        leave=False, mininterval=5)
 
     for perm in iterator:
         idx = torch.as_tensor(perm, dtype=torch.long, device=device)

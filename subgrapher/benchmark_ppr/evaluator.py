@@ -220,7 +220,8 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
         )
 
     cache = cache.to(device)
-    x_dummy = torch.zeros(data.num_nodes, 1, device=device)
+    x_full = data.x.to(device) if data.x is not None else torch.zeros(
+        data.num_nodes, 1, device=device)
 
     # Pre-compute DRNL once for this eval cache if not already stored
     if cache.drnl_feats is None:
@@ -243,18 +244,19 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
     iterator = DataLoader(torch.arange(M).tolist(), batch_size, shuffle=False)
     if verbose:
         iterator = tqdm(iterator, desc=f'Eval {split}',
-                        leave=False, mininterval=30)
+                        leave=False, mininterval=5)
 
     for perm in iterator:
         idx = torch.as_tensor(perm, dtype=torch.long, device=device)
-        batch = cache.make_batch(idx, x_dummy)
+        batch = cache.make_batch(idx, x_full)
 
         B = int(batch['u_idx'].size(0))
         if B == 0 or batch['total_edges'] == 0:
             continue
 
         if batch['drnl_x'] is not None:
-            x = batch['drnl_x'].to(device)
+            x = torch.cat([batch['drnl_x'].to(device),
+                            batch['x'].to(device)], dim=-1)
         else:
             x = compute_drnl_for_batch(batch, max_dist=drnl_max_dist)
         batch_vec = torch.repeat_interleave(
