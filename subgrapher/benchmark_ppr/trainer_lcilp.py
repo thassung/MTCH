@@ -17,6 +17,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -98,10 +99,8 @@ def build_or_load_neg_csr_cache(source_edge, target_edge, data, ppr_extractor,
 
 def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
                       batch_size, device, x_full=None, drnl_max_dist=6,
-                      margin=10.0, grad_clip=1.0,
-                      edges_per_epoch=None, verbose=False):
+                      grad_clip=1.0, edges_per_epoch=None, verbose=False):
     classifier.train()
-    criterion = nn.MarginRankingLoss(margin=margin, reduction="mean")
 
     n_total = len(pos_cache)
     if edges_per_epoch and edges_per_epoch < n_total:
@@ -158,10 +157,11 @@ def train_epoch_lcilp(classifier, pos_cache, neg_cache, optimizer,
         score_neg = classifier(neg_x, neg_b["edge_index"], neg_bvec,
                                neg_b["u_idx"], neg_b["v_idx"])
 
-        # MarginRankingLoss: target=1 → loss = max(0, margin − pos + neg)
+        # Cross-entropy ranking: stack [pos, neg] → target always index 0
         min_B = min(score_pos.size(0), score_neg.size(0))
-        targets = torch.ones(min_B, device=device)
-        loss = criterion(score_pos[:min_B], score_neg[:min_B], targets)
+        scores_stacked = torch.stack([score_pos[:min_B], score_neg[:min_B]], dim=1)
+        target = torch.zeros(min_B, dtype=torch.long, device=device)
+        loss = F.cross_entropy(scores_stacked, target)
         loss.backward()
 
         if grad_clip:
@@ -184,9 +184,10 @@ def train_model_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
                            eval_steps=5, device="cpu", verbose=True,
                            patience=10, min_delta=0.0001,
                            weight_decay=5e-4, grad_clip=1.0,
-                           margin=10.0, drnl_max_dist=6,
+                           drnl_max_dist=6,
                            edges_per_epoch=None, cache_dir=None,
-                           max_eval_edges=2000, eval_num_negs=None):
+                           max_eval_edges=2000, eval_num_negs=None,
+                           **_kwargs):
     """Train SubgraphClassifier with LCILP-faithful pipeline.
 
     Parameters
@@ -265,7 +266,7 @@ def train_model_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
             classifier, pos_cache, neg_cache, optimizer,
             batch_size, device,
             x_full=data.x.to(device) if data.x is not None else None,
-            drnl_max_dist=drnl_max_dist, margin=margin,
+            drnl_max_dist=drnl_max_dist,
             grad_clip=grad_clip, edges_per_epoch=edges_per_epoch,
             verbose=show_batch,
         )
