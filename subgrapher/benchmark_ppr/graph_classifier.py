@@ -7,7 +7,7 @@ head/tail embeddings — mirrors LCILP's GraphClassifier.
 
 Input features are DRNL structural labels concatenated with original node
 features (when feature_dim > 0), matching the PS2 setup for citation networks.
-Scores are raw unbounded logits — no sigmoid — for use with MarginRankingLoss.
+Scores are raw unbounded logits — no sigmoid — for use with CE ranking loss.
 """
 
 import torch
@@ -61,25 +61,20 @@ class SubgraphClassifier(nn.Module):
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
 
+    def encode(self, x: torch.Tensor, edge_index: torch.Tensor,
+               batch_vec: torch.Tensor):
+        """Run encoder once; return (h, g) for multi-pair scoring."""
+        h = self.encoder(x, edge_index)        # [N, hidden]
+        g = global_mean_pool(h, batch_vec)     # [B, hidden]
+        return h, g
+
+    def score_pairs(self, h: torch.Tensor, g: torch.Tensor,
+                    u_idx: torch.Tensor, v_idx: torch.Tensor) -> torch.Tensor:
+        """Score (u, v) pairs from pre-computed embeddings. [B] logits."""
+        return self.mlp(torch.cat([g, h[u_idx], h[v_idx]], dim=1)).squeeze(-1)
+
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
                 batch_vec: torch.Tensor, u_idx: torch.Tensor,
                 v_idx: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x          : [N, in_channels]  node features (DRNL or DRNL+content)
-        edge_index : [2, E]            mega-batch edge index
-        batch_vec  : [N]               batch assignment
-        u_idx      : [B]               indices of u nodes in mega-batch
-        v_idx      : [B]               indices of v nodes in mega-batch
-
-        Returns
-        -------
-        scores : [B] unbounded logits (no sigmoid — use with MarginRankingLoss)
-        """
-        h = self.encoder(x, edge_index)               # [N, hidden]
-        g = global_mean_pool(h, batch_vec)             # [B, hidden]
-        hu = h[u_idx]                                  # [B, hidden]
-        hv = h[v_idx]                                  # [B, hidden]
-        logit = self.mlp(torch.cat([g, hu, hv], dim=1))  # [B, 1]
-        return logit.squeeze(-1)                       # [B] unbounded
+        h, g = self.encode(x, edge_index, batch_vec)
+        return self.score_pairs(h, g, u_idx, v_idx)
