@@ -17,7 +17,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.subgraph_csr import SubgraphCSR
-from ..utils.drnl import compute_drnl_for_batch
 
 
 def _build_pair_csr_cache(all_u: torch.Tensor, all_v: torch.Tensor,
@@ -147,11 +146,11 @@ def evaluate_ppr(encoder, predictor, data, split_edge, ppr_extractor,
 
 @torch.no_grad()
 def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
+                        ppr_preprocessor=None,
                         split='valid', batch_size=1024, device='cpu',
                         K_values=(1, 3, 10, 50, 100),
                         max_edges=None, num_negs_per_pos=None,
-                        cache_dir=None, verbose=True,
-                        drnl_max_dist=6):
+                        cache_dir=None, verbose=True):
     """Evaluate SubgraphClassifier (LCILP-style) on a given split.
 
     Uses DRNL node features and graph-level scoring — no full-graph encoder.
@@ -223,20 +222,22 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
     x_full = data.x.to(device) if data.x is not None else torch.zeros(
         data.num_nodes, 1, device=device)
 
-    # Pre-compute DRNL once for this eval cache if not already stored
-    if cache.drnl_feats is None:
-        from ..utils.drnl import compute_drnl_for_csr
+    # Pre-compute PPR features once for this eval cache if not already stored
+    if cache.drnl_feats is None or cache.drnl_feats.shape[1] != 2:
+        from ..utils.drnl import compute_ppr_feats_for_csr
+        if ppr_preprocessor is None:
+            raise ValueError("ppr_preprocessor is required to compute PPR features for eval cache")
         if verbose:
-            print(f'[DRNL] Pre-computing DRNL for {split} eval cache '
+            print(f'[PPR] Pre-computing PPR features for {split} eval cache '
                   f'({int(cache.valid_mask.sum())} subgraphs)...')
         cache = cache.to('cpu')
-        cache.drnl_feats = compute_drnl_for_csr(cache, max_dist=drnl_max_dist,
-                                                 verbose=verbose)
+        cache.drnl_feats = compute_ppr_feats_for_csr(
+            cache, ppr_preprocessor.ppr_cache, verbose=verbose)
         if use_disk:
             cache.save(path)
             if verbose:
                 mb = os.path.getsize(path) / 1e6
-                print(f'[DRNL] Saved eval cache with DRNL: {path} ({mb:.0f} MB)')
+                print(f'[PPR] Saved eval cache with PPR feats: {path} ({mb:.0f} MB)')
         cache = cache.to(device)
 
     all_scores = torch.full((M,), float('nan'), device=device)
@@ -254,11 +255,8 @@ def evaluate_ppr_lcilp(classifier, data, split_edge, ppr_extractor,
         if B == 0 or batch['total_edges'] == 0:
             continue
 
-        if batch['drnl_x'] is not None:
-            x = torch.cat([batch['drnl_x'].to(device),
-                            batch['x'].to(device)], dim=-1)
-        else:
-            x = compute_drnl_for_batch(batch, max_dist=drnl_max_dist)
+        x = torch.cat([batch['drnl_x'].to(device),
+                        batch['x'].to(device)], dim=-1)
         batch_vec = torch.repeat_interleave(
             torch.arange(B, device=device), batch['num_nodes_vec'])
 

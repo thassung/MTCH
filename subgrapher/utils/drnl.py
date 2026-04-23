@@ -80,6 +80,53 @@ def compute_drnl_for_csr(csr, max_dist: int = 6, verbose: bool = True) -> torch.
     return x
 
 
+def compute_ppr_feats_for_csr(csr, ppr_cache: dict, verbose: bool = True) -> torch.Tensor:
+    """Pre-compute PPR-score structural features for every subgraph in a SubgraphCSR.
+
+    For subgraph i of pair (u_i, v_i), each node w gets (π_{u_i}(w), π_{v_i}(w)).
+    u_i and v_i are recovered from csr.node_ids using csr.u_sub / csr.v_sub.
+
+    Parameters
+    ----------
+    ppr_cache : dict[int, Tensor[num_nodes]]
+        ppr_cache[s] is the full PPR score vector from source node s.
+        Typically PPRPreprocessor.ppr_cache.
+
+    Returns
+    -------
+    FloatTensor [total_nodes, 2]  — col 0: π_u, col 1: π_v for each node.
+    """
+    from tqdm import tqdm
+
+    total_nodes = int(csr.node_ids.size(0))
+    x = torch.zeros(total_nodes, 2)
+    N = int(csr.u_sub.size(0))
+    it = (tqdm(range(N), desc='Pre-computing PPR features', leave=False,
+               mininterval=10)
+          if verbose else range(N))
+
+    for i in it:
+        if not bool(csr.valid_mask[i].item()):
+            continue
+        n_start = int(csr.node_offs[i].item())
+        n_end   = int(csr.node_offs[i + 1].item())
+        if n_end == n_start:
+            continue
+
+        node_ids_i = csr.node_ids[n_start:n_end]
+        u = int(node_ids_i[int(csr.u_sub[i].item())].item())
+        v = int(node_ids_i[int(csr.v_sub[i].item())].item())
+
+        ppr_u = ppr_cache.get(u)
+        ppr_v = ppr_cache.get(v)
+        if ppr_u is not None:
+            x[n_start:n_end, 0] = ppr_u[node_ids_i]
+        if ppr_v is not None:
+            x[n_start:n_end, 1] = ppr_v[node_ids_i]
+
+    return x
+
+
 def compute_drnl_for_batch(batch: dict, max_dist: int = 6) -> torch.Tensor:
     """Compute DRNL features for every node in a SubgraphCSR mega-batch.
 
