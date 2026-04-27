@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
     'use_checkpoint_cache': True,
     'save_run_artifacts': True,
     # PPR
-    'teleport_values': [0.50, 0.85, 0.95],
+    'teleport_values': [0.50, 0.33, 0.25],
     'alpha': [0.5],
     'ppr_epsilon': 1e-3,
     'ppr_window': 10,
@@ -448,7 +448,7 @@ def main():
     parser.add_argument('--encoders', nargs='+',
                         default=DEFAULT_CONFIG['encoders'])
     parser.add_argument('--teleport_values', nargs='+', type=float,
-                        default=[0.50, 0.85, 0.95],
+                        default=[0.50, 0.33, 0.25],
                         help='Teleport probabilities for PPR search space')
     parser.add_argument('--ppr_epsilon', type=float, default=1e-3,
                         help='Approximate PPR precision (Phase 2)')

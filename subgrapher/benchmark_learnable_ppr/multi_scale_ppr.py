@@ -25,7 +25,7 @@ class MultiScalePPR:
     def __init__(self, dataset_name, data=None, teleport_values=None,
                  preprocessed_dir='preprocessed', device=None):
         if teleport_values is None:
-            teleport_values = [0.50, 0.85, 0.95]
+            teleport_values = [0.50, 0.33, 0.25]
         self.teleport_values = sorted(teleport_values)
         self.num_scales = len(self.teleport_values)
         self.num_configs = self.num_scales ** 2
@@ -55,7 +55,7 @@ class MultiScalePPR:
                 print(f"  Computing PPR alpha={alpha} (not found at {path})")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 log_path = path.replace('.pt', '_log.txt')
-                preprocessor = PPRPreprocessor(data, ppr_alpha=alpha,
+                preprocessor = PPRPreprocessor(data, ppr_alpha=1 - alpha,
                                                log_file=log_path)
                 preprocessor.save(path)
                 self.preprocessors[alpha] = preprocessor
