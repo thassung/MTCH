@@ -23,5 +23,6 @@ cache_old/
 
 results/*
 cache/*
+exploring/*
 
 _gen*
