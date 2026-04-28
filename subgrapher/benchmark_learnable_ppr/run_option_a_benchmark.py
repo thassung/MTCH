@@ -146,7 +146,18 @@ def evaluate_option_a(model, selector, extractor, multi_scale_ppr,
     mrr = float((1.0 / ranks).mean())
     hits = {f'hits@{k}': float((ranks <= k).mean()) for k in K_values}
 
-    results = {'mrr': mrr, **hits}
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        flat_pos = np.repeat(pos_arr, num_neg_per_pos)
+        flat_neg = neg_arr.flatten()
+        all_preds = np.concatenate([flat_pos, flat_neg])
+        all_labels = np.concatenate([np.ones(len(flat_pos)), np.zeros(len(flat_neg))])
+        auc = float(roc_auc_score(all_labels, all_preds))
+        ap = float(average_precision_score(all_labels, all_preds))
+    except Exception:
+        auc, ap = 0.0, 0.0
+
+    results = {'mrr': mrr, 'auc': auc, 'ap': ap, **hits}
     return results
 
 
@@ -192,11 +203,12 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
     history = {
         'train_loss': [], 'val_loss': [],
         'best_val_loss': float('inf'), 'best_epoch': 0,
-        'stopped_early': False,
+        'stopped_early': False, 'total_time': 0.0,
     }
     best_val = float('inf')
     no_improve = 0
     best_state = None
+    _start = time.time()
 
     iterator = tqdm(range(1, epochs + 1), desc='Fine-tune',
                     mininterval=10) if verbose else range(1, epochs + 1)
@@ -279,6 +291,8 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
                 if verbose:
                     print(f'\n[Early Stop] epoch {epoch}')
                 break
+
+    history['total_time'] = time.time() - _start
 
     if best_state:
         model.load_state_dict(best_state['model'])
