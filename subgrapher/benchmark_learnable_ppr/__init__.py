@@ -8,6 +8,9 @@ from .multi_scale_ppr import MultiScalePPR
 from .autolink_ppr import AutoLinkPPR
 from .search_net import PPRSearchNet
 from .run_learnable_ppr_benchmark import run_learnable_ppr_benchmark
+from .option_a_model import OptionAGNN, PPRScaleSelector
+from .option_a_extractor import OptionAExtractor
+from .run_option_a_benchmark import run_option_a_benchmark
 
 
 def resolve_alpha_weights(alpha):
@@ -34,4 +37,9 @@ __all__ = [
     'run_learnable_ppr_benchmark',
     'resolve_alpha_weights',
     'evaluate_learnable_ppr_fullgraph',
+    # Option A
+    'OptionAGNN',
+    'PPRScaleSelector',
+    'OptionAExtractor',
+    'run_option_a_benchmark',
 ]
