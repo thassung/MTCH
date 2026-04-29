@@ -60,10 +60,10 @@ DEFAULT_CONFIG = {
     'weight_decay': 1e-5,
     'grad_clip': 1.0,
     # PPR / extraction
-    'teleport_values': [0.90, 0.50, 0.25],   # classic restart (high=local)
+    'teleport_values': [0.90, 0.50, 0.15],   # classic restart (high=local); empirical sizes ~12/42/98 at τ=1e-3
     'push_epsilon': 1e-5,
     'score_tau': 1e-3,
-    'extraction_alpha': 0.25,                # widest scale for envelope subgraph
+    'extraction_alpha': 0.15,                # widest scale for envelope subgraph
     # Datasets / encoders
     'datasets': ['Cora'],
     'save_run_artifacts': True,
@@ -185,6 +185,11 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
     model.to(device)
     selector.to(device)
     selector.eval()  # hard selection for fine-tuning
+    # Explicitly freeze selector params (PS2 convention). Optimizer is
+    # already scoped to model.parameters() only, but disabling grad here
+    # also saves autograd memory during the train backward.
+    for p in selector.parameters():
+        p.requires_grad_(False)
 
     ppr_dense = multi_scale_ppr.ppr_dense
     alphas = model.alphas

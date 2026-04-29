@@ -197,8 +197,12 @@ class OptionASearcher:
                     self.optimizer_selector.step()
 
                 # ---- Step 2: update model on train loss (w step) ---------
+                # Keep selector in train mode (soft weights) so the GNN always
+                # sees a smooth P_soft mixture — hard argmax during early random
+                # selection would give contradictory gradients across batches.
+                # Selector grads from train_loss are computed but discarded
+                # (only optimizer_model.step() is called).
                 self.optimizer_model.zero_grad()
-                self.selector.eval()   # freeze selector during model update
                 train_loss = self._compute_loss_batch(
                     self.model, self.selector,
                     train_edge, train_neg,
@@ -210,8 +214,6 @@ class OptionASearcher:
                     self.optimizer_model.step()
                     epoch_loss += train_loss.item()
                     steps += 1
-
-                self.selector.train()
 
             avg_loss = epoch_loss / max(steps, 1)
             history['search_loss'].append(avg_loss)

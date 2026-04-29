@@ -177,14 +177,19 @@ class OptionAGNN(nn.Module):
             lin.reset_parameters()
 
     def predict(self, h_u, h_v):
-        """Link predictor on paired embeddings."""
+        """Link predictor on paired embeddings — returns LOGITS.
+
+        Sigmoid is applied at loss time (BCEWithLogitsLoss) for numerical
+        stability. Eval ranking metrics (MRR/Hits/AUC/AP) are rank-based and
+        unaffected by the monotonic sigmoid removal.
+        """
         x = h_u * h_v
         x = self.pre_mlp_norm(x)
         for lin in self.predictor_lins[:-1]:
             x = lin(x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-        return torch.sigmoid(self.predictor_lins[-1](x))
+        return self.predictor_lins[-1](x)
 
     # ------------------------------------------------------------------
     # Core PPR utilities
@@ -311,7 +316,14 @@ class OptionAGNN(nn.Module):
                 nodes_S, u_loc, v_loc, x_full, w_neg[i], ppr_dense)
             neg_preds.append(self.predict(h_u.unsqueeze(0), h_v.unsqueeze(0)))
 
-        pos_out = torch.cat(pos_preds)  # [B, 1]
-        neg_out = torch.cat(neg_preds)
+        pos_logits = torch.cat(pos_preds)  # [B, 1] — logits from predict()
+        neg_logits = torch.cat(neg_preds)
 
-        return (-torch.log(pos_out + 1e-15) - torch.log(1 - neg_out + 1e-15)).mean()
+        # BCEWithLogitsLoss: numerically stable replacement for the previous
+        # sigmoid + manual -log(p) - log(1-p) form.
+        all_logits = torch.cat([pos_logits, neg_logits], dim=0)
+        all_targets = torch.cat([
+            torch.ones_like(pos_logits),
+            torch.zeros_like(neg_logits),
+        ], dim=0)
+        return F.binary_cross_entropy_with_logits(all_logits, all_targets)
