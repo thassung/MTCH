@@ -21,7 +21,7 @@ from datetime import datetime
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..benchmark.data_prep import prepare_link_prediction_data
+from ..benchmark.data_prep import prepare_planetoid_data
 from .multi_scale_ppr import MultiScalePPR
 from .option_a_model import OptionAGNN, PPRScaleSelector
 from .option_a_extractor import OptionAExtractor, build_or_load_cache, sample_neg_subgraphs
@@ -436,14 +436,24 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
     tqdm.write(f"Extraction alpha: {config['extraction_alpha']}, tau: {config['score_tau']}")
 
     # ---- Data ---------------------------------------------------------------
-    data, split_edge = prepare_link_prediction_data(
-        dataset_name, dataset_path,
-        feature_method=config['feature_method'],
-        feature_dim=config['feature_dim'])
+    # Use the Planetoid-specific loader (real node features, train/val/test split).
+    # This mirrors what learnable_ppr_planetoid.ipynb does in cell 4.
+    dd = prepare_planetoid_data(dataset_name, root=dataset_path)
+    data = dd['data']
+    split_edge = dd['split_edge']
+    # Swap to train-only edges so val/test edges aren't visible during message passing.
+    if not getattr(data, '_edge_index_train_only', False):
+        data._orig_edge_index = data.edge_index
+        data.edge_index = dd['train_edge_index']
+        data._edge_index_train_only = True
+        tqdm.write(f"  [train-only edges] swapped: "
+                   f"{data._orig_edge_index.size(1):,} -> {data.edge_index.size(1):,}")
     tqdm.write(f"  {data}")
 
     # ---- PPR (dense matrices) -----------------------------------------------
-    preprocessed_dir = os.path.join(dataset_path, 'preprocessed')
+    # Cache PPR vectors at the same root as other caches; mirrors cache/benchmark-ppr/ layout.
+    preprocessed_dir = os.path.join(
+        config.get('cache_root', 'cache'), 'option-a', 'ppr')
     gpu_device = device if config.get('gpu_ppr', True) else None
     tqdm.write('Loading / computing multi-scale PPR...')
     multi_scale_ppr = MultiScalePPR(
