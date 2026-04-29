@@ -82,24 +82,45 @@ class PPRScaleSelector(nn.Module):
     """
 
     def __init__(self, in_channels, hidden_channels=256, num_layers=3,
-                 num_scales=3, temperature=1.0):
+                 num_scales=3, temperature=1.0, scale_emb_dim=32):
         super().__init__()
         self.temperature = temperature
         self.num_scales = num_scales
+        self.scale_emb_dim = scale_emb_dim
+
+        # Learnable per-scale embedding: gives the MLP a scale-identity signal
+        # so it can express preferences like "always prefer alpha index 1" even
+        # when cross-pair signals across scales are statistically similar.
+        # Without this the alpha softmax tends to collapse onto whichever scale
+        # has the largest cross-pair magnitude.
+        self.scale_emb = nn.Parameter(
+            torch.randn(num_scales, scale_emb_dim) * 0.02)
 
         self.layers = nn.ModuleList()
-        self.layers.append(nn.Linear(in_channels, hidden_channels, bias=False))
+        self.layers.append(
+            nn.Linear(in_channels + scale_emb_dim, hidden_channels, bias=False))
         for _ in range(num_layers - 2):
             self.layers.append(
                 nn.Linear(hidden_channels, hidden_channels, bias=False))
         self.layers.append(nn.Linear(hidden_channels, 1, bias=False))
 
     def reset_parameters(self):
+        nn.init.normal_(self.scale_emb, mean=0.0, std=0.02)
         for layer in self.layers:
             layer.reset_parameters()
 
     def set_temperature(self, temp):
         self.temperature = temp
+
+    def _logits(self, cross_repr):
+        """Forward through MLP → [B, num_scales] pre-softmax logits."""
+        B, K, _ = cross_repr.shape
+        scale_emb_b = self.scale_emb.unsqueeze(0).expand(B, -1, -1)
+        x = torch.cat([cross_repr, scale_emb_b], dim=-1)
+        for layer in self.layers[:-1]:
+            x = layer(x)
+            x = F.relu(x)
+        return self.layers[-1](x).squeeze(-1)
 
     def forward(self, cross_repr):
         """
@@ -108,15 +129,10 @@ class PPRScaleSelector(nn.Module):
         Returns:
             weights: [B, num_scales]
         """
-        x = cross_repr
-        for layer in self.layers[:-1]:
-            x = layer(x)
-            x = F.relu(x)
-        x = self.layers[-1](x).squeeze(-1)  # [B, num_scales]
-        weights = torch.softmax(x / self.temperature, dim=-1)
+        logits = self._logits(cross_repr)
+        weights = torch.softmax(logits / self.temperature, dim=-1)
 
         if not self.training:
-            B, C = weights.shape
             indices = torch.argmax(weights, dim=-1)
             one_hot = torch.zeros_like(weights)
             one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
@@ -128,12 +144,7 @@ class PPRScaleSelector(nn.Module):
         """Hard argmax: which alpha index is selected per edge."""
         self.eval()
         with torch.no_grad():
-            x = cross_repr
-            for layer in self.layers[:-1]:
-                x = layer(x)
-                x = F.relu(x)
-            x = self.layers[-1](x).squeeze(-1)
-            return torch.argmax(x, dim=-1)
+            return torch.argmax(self._logits(cross_repr), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -225,29 +236,40 @@ class OptionAGNN(nn.Module):
 
     def _build_p_soft(self, nodes_S, weights, ppr_dense, device):
         """
-        Soft PPR adjacency for one subgraph.
+        Soft PPR adjacency for one subgraph (sym-norm with explicit self-loops).
 
-        P_soft = sum_k w_k * renorm(PPR_k[nodes_S][:, nodes_S])
+        Per-scale:  P̂_α = D_α^(-1/2) (I + P_α|_S) D_α^(-1/2)
+        Mixture:    P_soft = Σ_k w_k · P̂_α_k
+
+        Adding I before normalization fixes the all-zero-rows pathology that
+        arose when score-threshold extraction at the widest alpha left
+        local-alpha slices with empty rows for peripheral nodes — those rows
+        would become uniform noise after row-normalization, drowning the
+        selector signal. Sym-norm with self-loops is the GDC / APPNP / S²GC
+        recipe (NeurIPS'19, ICLR'19, ICLR'21).
 
         Args:
             nodes_S: [|S|] global node indices (cpu or device)
-            weights: [num_scales] (for this single edge)
+            weights: [num_scales] selector output for this edge
             ppr_dense: {alpha: [N, N]}
             device: target device
 
         Returns:
-            [|S|, |S|] row-normalized
+            [|S|, |S|]
         """
         n = len(nodes_S)
-        P_soft = torch.zeros(n, n, device=device)
         nodes_cpu = nodes_S.cpu()
+        eye = torch.eye(n, device=device)
+        P_soft = torch.zeros(n, n, device=device)
         for i, alpha in enumerate(self.alphas):
             mat = ppr_dense[alpha]
             P_slice = mat[nodes_cpu][:, nodes_cpu]
             if P_slice.device != device:
                 P_slice = P_slice.to(device, non_blocking=True)
-            row_sums = P_slice.sum(dim=1, keepdim=True).clamp(min=1e-12)
-            P_soft = P_soft + weights[i] * (P_slice / row_sums)
+            A_tilde = eye + P_slice
+            d_inv_sqrt = A_tilde.sum(dim=1).clamp(min=1e-6).pow(-0.5)
+            P_hat = d_inv_sqrt.unsqueeze(1) * A_tilde * d_inv_sqrt.unsqueeze(0)
+            P_soft = P_soft + weights[i] * P_hat
         return P_soft
 
     def forward_subgraph(self, nodes_S, u_local, v_local, x_full,

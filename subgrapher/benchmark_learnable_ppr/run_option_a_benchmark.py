@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     # Selector
     'selector_hidden': 256,
     'selector_layers': 3,
+    'selector_scale_emb_dim': 32,
     # Search
     'search_epochs': 50,
     'search_batch_size': 32,       # small — each batch is B subgraph GNN forwards
@@ -61,13 +62,21 @@ DEFAULT_CONFIG = {
     'grad_clip': 1.0,
     # PPR / extraction
     'teleport_values': [0.90, 0.50, 0.15],   # classic restart (high=local); empirical sizes ~12/42/98 at τ=1e-3
-    'push_epsilon': 1e-5,
+    # Coarse-coarse eps: same precision for train pos cache AND live negs+val
+    # avoids the subgraph-size-as-label-leak that asymmetric eps creates.
+    # 5e-4 is fast enough to extract live during search/eval.
+    'push_epsilon': 5e-4,
     'score_tau': 1e-3,
     'extraction_alpha': 0.15,                # widest scale for envelope subgraph
     # Datasets / encoders
     'datasets': ['Cora'],
     'save_run_artifacts': True,
     'use_checkpoint_cache': True,
+    # Full-graph eval (apples-to-apples vs full-graph baselines)
+    'full_graph_eval': True,
+    'full_graph_eval_max_nodes': 8000,        # skip on PubMed (~19.7k), runs on Cora/CiteSeer
+    'cache_root': 'cache',                    # repo-root-relative cache layout
+    'results_root': 'results/benchmark-option-a',
 }
 
 
@@ -159,6 +168,112 @@ def evaluate_option_a(model, selector, extractor, multi_scale_ppr,
 
     results = {'mrr': mrr, 'auc': auc, 'ap': ap, **hits}
     return results
+
+
+@torch.no_grad()
+def evaluate_option_a_full_graph(model, selector, multi_scale_ppr,
+                                 data, split_edge, split='test',
+                                 batch_size=2048, device='cpu',
+                                 K_values=None, max_nodes=8000):
+    """
+    Full-graph 1000-neg evaluation for LPPR — apples-to-apples vs the
+    Full-Graph / Static-PPR / k-hop baselines.
+
+    Computes a single P_soft over the full graph using the train-set average
+    selector weights (one alpha mixture, not per-edge), runs the encoder
+    once, then scores all eval edges via dot/predict.
+
+    Memory: dense [N,N] tensors per scale. Skipped if N > max_nodes.
+
+    Returns:
+        results dict (mrr, auc, ap, hits@K) or None if skipped.
+    """
+    if K_values is None:
+        K_values = [1, 3, 10, 50, 100]
+
+    N = data.num_nodes
+    if N > max_nodes:
+        print(f'  [full-graph eval] SKIPPED: N={N} > max_nodes={max_nodes} '
+              f'(would OOM). Per-subgraph result still produced.')
+        return None
+
+    model.eval()
+    selector.eval()
+
+    ppr_dense = multi_scale_ppr.ppr_dense
+    alphas = model.alphas
+    x_full = data.x.float().to(device)
+
+    # 1. Get average selector weights over train edges (single forward over train)
+    train_src = split_edge['train']['source_node'].to(device)
+    train_dst = split_edge['train']['target_node'].to(device)
+    avg_w = torch.zeros(len(alphas), device=device)
+    cnt = 0
+    for perm in DataLoader(torch.arange(train_src.size(0)), 1024):
+        cross = model.compute_selector_input(
+            train_src[perm], train_dst[perm], x_full, ppr_dense, alphas)
+        w = selector(cross)  # [B, K]; eval mode → one-hot
+        avg_w = avg_w + w.sum(dim=0)
+        cnt += len(perm)
+    avg_w = avg_w / max(cnt, 1)
+
+    # 2. Build full-graph P_soft: per-scale sym-norm + I, then weighted mix
+    eye = torch.eye(N, device=device)
+    P_full = torch.zeros(N, N, device=device)
+    for i, alpha in enumerate(alphas):
+        mat = ppr_dense[alpha]
+        P_slice = mat.to(device) if mat.device != device else mat
+        A_tilde = eye + P_slice
+        d_inv_sqrt = A_tilde.sum(dim=1).clamp(min=1e-6).pow(-0.5)
+        P_hat = d_inv_sqrt.unsqueeze(1) * A_tilde * d_inv_sqrt.unsqueeze(0)
+        P_full = P_full + avg_w[i] * P_hat
+
+    # 3. Single encoder forward
+    h = model.encoder(x_full, P_full)
+
+    # 4. Score eval edges (chunked, mirroring evaluate_link_prediction)
+    source = split_edge[split]['source_node']
+    target = split_edge[split]['target_node']
+    target_neg = split_edge[split]['target_node_neg']
+    num_pos = source.size(0)
+    num_neg = target_neg.size(1)
+
+    eval_bs = min(batch_size, 2048)
+    pos_preds, neg_preds = [], []
+    for perm in DataLoader(torch.arange(num_pos), eval_bs):
+        src = source[perm].to(device)
+        dst = target[perm].to(device)
+        pos_preds.append(model.predict(h[src], h[dst]).squeeze(-1).cpu())
+
+        dst_neg_chunk = target_neg[perm].to(device)
+        src_rep = src.unsqueeze(1).expand_as(dst_neg_chunk).reshape(-1)
+        dst_neg_flat = dst_neg_chunk.reshape(-1)
+        chunk_neg = []
+        for ns in range(0, src_rep.size(0), eval_bs):
+            ne = min(ns + eval_bs, src_rep.size(0))
+            chunk_neg.append(
+                model.predict(h[src_rep[ns:ne]],
+                              h[dst_neg_flat[ns:ne]]).squeeze(-1).cpu())
+        neg_preds.append(torch.cat(chunk_neg).view(len(perm), num_neg))
+
+    del P_full, h, eye
+    if device != 'cpu':
+        torch.cuda.empty_cache()
+
+    pos_pred = torch.cat(pos_preds, dim=0)
+    neg_pred = torch.cat(neg_preds, dim=0)
+
+    from ..benchmark.evaluator import compute_mrr, compute_hits_at_k, compute_auc_ap
+    mrr = compute_mrr(pos_pred, neg_pred)
+    hits = {f'hits@{k}': compute_hits_at_k(pos_pred, neg_pred, k)
+            for k in K_values if k <= num_neg}
+    auc, ap = compute_auc_ap(pos_pred, neg_pred)
+
+    return {
+        'mrr': mrr, 'auc': auc, 'ap': ap,
+        'avg_alpha_weights': [float(x) for x in avg_w.cpu().tolist()],
+        **hits,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +462,10 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
 
     cache_dir = None
     if config.get('use_checkpoint_cache'):
-        cache_dir = os.path.join(dataset_path, 'cache', dataset_name, 'option_a',
-                                 f'eps{config["push_epsilon"]}_tau{config["score_tau"]}')
+        # Repo-root-relative cache layout (matches benchmark-ppr / benchmark-khop)
+        cache_dir = os.path.join(
+            config.get('cache_root', 'cache'), 'option-a', dataset_name,
+            f'eps{config["push_epsilon"]}_tau{config["score_tau"]}')
 
     tqdm.write('Building/loading train subgraph cache...')
     train_cache = build_or_load_cache(
@@ -371,7 +488,8 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
         hidden_channels=config['selector_hidden'],
         num_layers=config['selector_layers'],
         num_scales=len(config['teleport_values']),
-        temperature=config['temperature_start'])
+        temperature=config['temperature_start'],
+        scale_emb_dim=config.get('selector_scale_emb_dim', 32))
 
     tqdm.write(f'  OptionAGNN params: {sum(p.numel() for p in model.parameters()):,}')
     tqdm.write(f'  PPRScaleSelector params: {sum(p.numel() for p in selector.parameters()):,}')
@@ -429,28 +547,113 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
         verbose=True)
 
     # ---- Evaluation ---------------------------------------------------------
-    tqdm.write('\n[Eval] Running per-subgraph evaluation...')
-    val_results = evaluate_option_a(
+    tqdm.write('\n[Eval] Running per-subgraph evaluation (100-neg)...')
+    val_subgraph = evaluate_option_a(
         model, selector, extractor, multi_scale_ppr,
         data, split_edge, split='valid',
-        batch_size=config['search_batch_size'], device=device)
-    test_results = evaluate_option_a(
+        batch_size=config['search_batch_size'], device=device,
+        max_neg_per_pos=100)
+    test_subgraph = evaluate_option_a(
         model, selector, extractor, multi_scale_ppr,
         data, split_edge, split='test',
-        batch_size=config['search_batch_size'], device=device)
+        batch_size=config['search_batch_size'], device=device,
+        max_neg_per_pos=100)
+    tqdm.write(f'  [per-subgraph] Val  MRR={val_subgraph["mrr"]:.4f}  '
+               f'AUC={val_subgraph["auc"]:.4f}  AP={val_subgraph["ap"]:.4f}')
+    tqdm.write(f'  [per-subgraph] Test MRR={test_subgraph["mrr"]:.4f}  '
+               f'AUC={test_subgraph["auc"]:.4f}  AP={test_subgraph["ap"]:.4f}')
 
-    tqdm.write(f'\n  Val  MRR={val_results["mrr"]:.4f}  {val_results}')
-    tqdm.write(f'  Test MRR={test_results["mrr"]:.4f}  {test_results}')
+    # Full-graph eval (apples-to-apples vs Full-Graph / Static-PPR / k-hop)
+    val_full, test_full = None, None
+    if config.get('full_graph_eval', True):
+        tqdm.write('\n[Eval] Running full-graph evaluation (1000-neg)...')
+        max_nodes = config.get('full_graph_eval_max_nodes', 8000)
+        val_full = evaluate_option_a_full_graph(
+            model, selector, multi_scale_ppr, data, split_edge,
+            split='valid', device=device, max_nodes=max_nodes)
+        test_full = evaluate_option_a_full_graph(
+            model, selector, multi_scale_ppr, data, split_edge,
+            split='test', device=device, max_nodes=max_nodes)
+        if test_full is not None:
+            tqdm.write(f'  [full-graph]   Val  MRR={val_full["mrr"]:.4f}  '
+                       f'AUC={val_full["auc"]:.4f}  AP={val_full["ap"]:.4f}')
+            tqdm.write(f'  [full-graph]   Test MRR={test_full["mrr"]:.4f}  '
+                       f'AUC={test_full["auc"]:.4f}  AP={test_full["ap"]:.4f}')
 
-    return {
+    # Headline test_results = full-graph if available, else per-subgraph
+    headline_val = val_full if val_full is not None else val_subgraph
+    headline_test = test_full if test_full is not None else test_subgraph
+
+    result = {
         'dataset': dataset_name,
-        'config': config,
-        'search_history': search_history,
-        'finetune_history': finetune_history,
-        'val_results': val_results,
-        'test_results': test_results,
+        'encoder': 'PPRDiff',
+        'method': 'Option A',
+        'eval_mode': 'full-graph' if test_full is not None else 'per-subgraph',
+        'val_results': headline_val,
+        'test_results': headline_test,
+        'subgraph_val_results': val_subgraph,
+        'subgraph_test_results': test_subgraph,
+        'full_graph_val_results': val_full,
+        'full_graph_test_results': test_full,
         'alpha_distribution': alpha_counts.tolist(),
+        'dominant_alpha': config['teleport_values'][int(alpha_counts.argmax())],
+        'teleport_values': config['teleport_values'],
+        'extraction_alpha': config['extraction_alpha'],
+        'push_epsilon': config['push_epsilon'],
+        'score_tau': config['score_tau'],
+        'search_time': float(search_history.get('total_time', 0)),
+        'finetune_time': float(finetune_history.get('total_time', 0)),
+        'train_time': float(search_history.get('total_time', 0)
+                            + finetune_history.get('total_time', 0)),
+        'best_val_loss_search': float(search_history.get('best_val_loss', 0)),
+        'best_epoch_search': int(search_history.get('best_epoch', 0)),
+        'best_val_loss_finetune': float(finetune_history.get('best_val_loss', 0)),
+        'best_epoch_finetune': int(finetune_history.get('best_epoch', 0)),
+        'stopped_early': bool(finetune_history.get('stopped_early', False)),
+        'config': {k: v for k, v in config.items()
+                   if k not in ('datasets',)},
+        'seed': config.get('seed', 42),
+        'run_id': datetime.now().strftime('%Y%m%d_%H%M%S'),
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
+
+    # Save JSON if requested
+    if config.get('save_results', False):
+        results_root = config.get('results_root', 'results/benchmark-option-a')
+        save_dir = os.path.join(results_root, dataset_name)
+        run_dir = os.path.join(save_dir, 'runs', result['run_id'])
+        os.makedirs(run_dir, exist_ok=True)
+        for p in [os.path.join(run_dir, 'full_results.json'),
+                  os.path.join(save_dir, 'full_results.json')]:
+            with open(p, 'w') as f:
+                json.dump({k: v for k, v in result.items()
+                           if k not in ('config',) or True}, f,
+                          indent=2, default=str)
+        tqdm.write(f'\nSaved: {save_dir}/full_results.json')
+
+    return result
+
+
+# Convenience alias matching the run_one(...) idiom from the rest of the codebase
+def run_one(dataset_name, dataset_path='data/Planetoid', config=None,
+            device=None, **overrides):
+    """
+    Single-dataset entry point. Used by both the notebook cell loop and the
+    CLI script in scripts/run_lppr.py — same code path.
+
+    Args:
+        dataset_name: 'Cora' / 'CiteSeer' / 'PubMed'
+        dataset_path: Planetoid root
+        config: full config dict; if None, DEFAULT_CONFIG is used
+        device: 'cuda' / 'cpu' / None (auto)
+        **overrides: any DEFAULT_CONFIG key to override
+    """
+    if config is None:
+        config = DEFAULT_CONFIG.copy()
+    config.update(overrides)
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return run_option_a_experiment(dataset_name, dataset_path, config, device=device)
 
 
 def run_option_a_benchmark(config=None, device=None):
