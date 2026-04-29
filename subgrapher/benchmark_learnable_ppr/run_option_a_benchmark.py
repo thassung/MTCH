@@ -75,7 +75,8 @@ DEFAULT_CONFIG = {
     # Full-graph eval (apples-to-apples vs full-graph baselines)
     'full_graph_eval': True,
     'full_graph_eval_max_nodes': 8000,        # skip on PubMed (~19.7k), runs on Cora/CiteSeer
-    'cache_root': 'cache',                    # repo-root-relative cache layout
+    'cache_root': 'cache',                    # repo-root-relative cache layout (subgraph cache)
+    'preprocessed_dir': 'preprocessed',       # multi-scale PPR cache (matches notebook)
     'results_root': 'results/benchmark-option-a',
 }
 
@@ -451,9 +452,11 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
     tqdm.write(f"  {data}")
 
     # ---- PPR (dense matrices) -----------------------------------------------
-    # Cache PPR vectors at the same root as other caches; mirrors cache/benchmark-ppr/ layout.
-    preprocessed_dir = os.path.join(
-        config.get('cache_root', 'cache'), 'option-a', 'ppr')
+    # Read multi-scale PPR vectors from the same `preprocessed/` root that the
+    # notebook uses (MultiScalePPR's default). Keeping this path matches any
+    # existing per-alpha PPR caches on disk — those take tens of minutes to
+    # recompute on PubMed, so reuse matters.
+    preprocessed_dir = config.get('preprocessed_dir', 'preprocessed')
     gpu_device = device if config.get('gpu_ppr', True) else None
     tqdm.write('Loading / computing multi-scale PPR...')
     multi_scale_ppr = MultiScalePPR(
