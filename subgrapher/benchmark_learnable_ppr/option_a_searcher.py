@@ -49,7 +49,7 @@ class OptionASearcher:
                  extractor, train_cache, device='cuda',
                  lr=0.01, lr_selector=3e-4, lr_min=1e-3,
                  temperature_start=1.0, temperature_end=0.2,
-                 edges_per_epoch=None):
+                 edges_per_epoch=None, search_extractor=None):
         self.model = model.to(device)
         self.selector = selector.to(device)
         self.multi_scale_ppr = multi_scale_ppr
@@ -58,6 +58,10 @@ class OptionASearcher:
         self.data = data.to(device)
         self.split_edge = split_edge
         self.extractor = extractor
+        # search_extractor is used for all LIVE extractions during search
+        # (negatives, val positives, val negatives).  Defaults to extractor.
+        # Pass a coarser-epsilon extractor here for a large speed-up.
+        self.search_extractor = search_extractor if search_extractor is not None else extractor
         self.train_cache = train_cache
         self.device = device
         self.temperature_start = temperature_start
@@ -169,18 +173,17 @@ class OptionASearcher:
                 pos_subs = self._get_subgraphs_from_cache(
                     self.train_cache, perm)
                 neg_subs = sample_neg_subgraphs(
-                    self.extractor, train_neg)
+                    self.search_extractor, train_neg)
 
                 # ---- Step 1: update selector on val loss (theta step) ----
                 val_perm = val_cycler.next(self.device)
                 val_edge = torch.stack([val_src[val_perm], val_dst[val_perm]], dim=0)
                 val_neg = self._neg(self._neg_val_idx, len(val_perm))
 
-                # val negatives need subgraphs too (extracted on the fly)
                 val_pos_subs = sample_neg_subgraphs(
-                    self.extractor, val_edge)   # reuse helper, same API
+                    self.search_extractor, val_edge)
                 val_neg_subs = sample_neg_subgraphs(
-                    self.extractor, val_neg)
+                    self.search_extractor, val_neg)
 
                 self.optimizer_selector.zero_grad()
                 val_loss = self._compute_loss_batch(

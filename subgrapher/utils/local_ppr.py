@@ -75,8 +75,8 @@ def approximate_ppr(adj_csr, seed_set, alpha=0.85, epsilon=1e-3):
         put_val = alpha * push_val
 
         start, end = adj_csr.indptr[node], adj_csr.indptr[node + 1]
-        neighbors = adj_csr.indices[start:end]
-        weights = adj_csr.data[start:end]
+        neighbors = np.asarray(adj_csr.indices[start:end]).ravel()
+        weights = np.asarray(adj_csr.data[start:end]).ravel()
 
         old_res_nbrs = res[neighbors].copy()
         res[neighbors] += put_val * weights / d

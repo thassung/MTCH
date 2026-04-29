@@ -170,7 +170,7 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
                       epochs=100, batch_size=32, lr=0.005,
                       weight_decay=1e-5, grad_clip=1.0, patience=20,
                       eval_steps=5, device='cpu', verbose=True,
-                      checkpoint_dir=None):
+                      checkpoint_dir=None, neg_extractor=None):
     """
     Fine-tune OptionAGNN with frozen selector (hard alpha selection).
 
@@ -179,6 +179,8 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
     """
     from sklearn.metrics import roc_auc_score
     from torch_geometric.utils import negative_sampling, add_self_loops
+
+    _neg_ext = neg_extractor if neg_extractor is not None else extractor
 
     model.to(device)
     selector.to(device)
@@ -226,7 +228,7 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
             train_neg = negative_sampling(
                 neg_idx, num_nodes=data.num_nodes,
                 num_neg_samples=len(perm)).to(device)
-            neg_subs = sample_neg_subgraphs(extractor, train_neg)
+            neg_subs = sample_neg_subgraphs(_neg_ext, train_neg)
 
             optimizer.zero_grad()
             loss = model.compute_loss(
@@ -258,8 +260,8 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
                 val_neg = negative_sampling(
                     neg_idx, num_nodes=data.num_nodes,
                     num_neg_samples=n_val_sample).to(device)
-                vp_subs = sample_neg_subgraphs(extractor, val_edge)
-                vn_subs = sample_neg_subgraphs(extractor, val_neg)
+                vp_subs = sample_neg_subgraphs(_neg_ext, val_edge)
+                vn_subs = sample_neg_subgraphs(_neg_ext, val_neg)
                 vl = model.compute_loss(
                     selector, val_edge, val_neg, x_full,
                     ppr_dense, vp_subs, vn_subs).item()
