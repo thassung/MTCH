@@ -1,5 +1,5 @@
 """
-Bi-level architecture search for Option A (PS2-style learnable PPR).
+Bi-level architecture search for LPPR (PS2-style learnable PPR).
 
 Parameters:
   w (model weights):  PPRDiffusionEncoder + LinkPredictor  -> trained on train loss
@@ -18,25 +18,25 @@ from torch.utils.data import DataLoader
 from torch_geometric.utils import negative_sampling, add_self_loops
 from tqdm import tqdm
 
-from .option_a_extractor import OptionASubgraphCache, sample_neg_subgraphs
+from .option_a_extractor import LPPRSubgraphCache, sample_neg_subgraphs
 
 
 def _concat(xs):
     return torch.cat([x.view(-1) for x in xs])
 
 
-class OptionASearcher:
+class LPPRSearcher:
     """
-    Bi-level searcher for Option A.
+    Bi-level searcher for LPPR.
 
     Args:
-        model: OptionAGNN instance
+        model: LPPRGNN instance
         selector: PPRScaleSelector instance
         multi_scale_ppr: MultiScalePPR (for ppr_dense access)
         data: PyG Data (full graph)
         split_edge: edge split dict
-        extractor: OptionAExtractor
-        train_cache: OptionASubgraphCache for train edges
+        extractor: LPPRSubgraphExtractor
+        train_cache: LPPRSubgraphCache for train edges
         device: torch device
         lr: learning rate for model (w)
         lr_selector: learning rate for selector (theta)
@@ -147,7 +147,7 @@ class OptionASearcher:
         best_val_loss = float('inf')
         start_time = time.time()
 
-        iterator = (tqdm(range(epochs), desc='OptionA Search',
+        iterator = (tqdm(range(epochs), desc='LPPR Search',
                          mininterval=10, maxinterval=60)
                     if verbose else range(epochs))
 

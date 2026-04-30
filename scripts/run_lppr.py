@@ -1,5 +1,5 @@
 """
-Linux-nano-friendly CLI for the Learnable PPR (LPPR / Option A) framework.
+Linux-nano-friendly CLI for the Learnable PPR (LPPR / LPPR) framework.
 
 Same code path as `learnable_ppr_planetoid.ipynb` — both call
 `subgrapher.benchmark_learnable_ppr.run_option_a_benchmark.run_one`.
@@ -33,7 +33,7 @@ from subgrapher.benchmark_learnable_ppr.run_option_a_benchmark import (
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='Learnable PPR (Option A) — single-dataset runner')
+        description='Learnable PPR (LPPR) — single-dataset runner')
     p.add_argument('--dataset', required=True,
                    choices=['Cora', 'CiteSeer', 'PubMed'],
                    help='Planetoid dataset')
@@ -41,28 +41,55 @@ def parse_args():
                    help='Planetoid root (downloads here on first use)')
     p.add_argument('--device', default=None,
                    help='cuda | cpu | None (auto-detect)')
+    # Encoder backbone (default GCN — matches the GCN baseline cell)
+    p.add_argument('--encoder', default=DEFAULT_CONFIG['encoder_type'],
+                   choices=['GCN', 'SAGE', 'GAT', 'PPRDiff'],
+                   help='Backbone encoder operating on P_soft. GCN/SAGE/GAT '
+                        'are PS2-style apples-to-apples vs the same-named '
+                        'baseline; PPRDiff is the original ablation.')
+    # Training mode (default auto: joint for ≤10k nodes, bilevel for PubMed)
+    p.add_argument('--train-mode', default=DEFAULT_CONFIG['train_mode'],
+                   choices=['auto', 'joint', 'bilevel'],
+                   help='joint = single-phase, recommended for ≤10k nodes; '
+                        'bilevel = original PS2 θ-on-val/w-on-train; '
+                        'auto picks joint for ≤10k nodes else bilevel.')
+    # Joint training knobs
+    p.add_argument('--joint-epochs', type=int,
+                   default=DEFAULT_CONFIG['joint_epochs'])
+    p.add_argument('--joint-patience', type=int,
+                   default=DEFAULT_CONFIG['joint_patience'])
+    p.add_argument('--entropy-coeff', type=float,
+                   default=DEFAULT_CONFIG['joint_entropy_coeff_start'],
+                   help='Initial entropy bonus coefficient for joint training')
+    # Bi-level knobs (only used when --train-mode=bilevel)
     p.add_argument('--search-epochs', type=int,
                    default=DEFAULT_CONFIG['search_epochs'])
     p.add_argument('--finetune-epochs', type=int,
                    default=DEFAULT_CONFIG['finetune_epochs'])
+    # Architecture
     p.add_argument('--hidden', type=int,
                    default=DEFAULT_CONFIG['hidden_channels'])
     p.add_argument('--num-layers', type=int,
                    default=DEFAULT_CONFIG['num_layers'])
+    p.add_argument('--gat-heads', type=int,
+                   default=DEFAULT_CONFIG['gat_heads'])
+    # PPR / extraction
     p.add_argument('--push-epsilon', type=float,
                    default=DEFAULT_CONFIG['push_epsilon'],
                    help='PPR push precision (5e-4 default = coarse-coarse)')
     p.add_argument('--score-tau', type=float,
                    default=DEFAULT_CONFIG['score_tau'])
     p.add_argument('--seed', type=int, default=42)
+    # Eval
     p.add_argument('--no-full-graph-eval', action='store_true',
                    help='Skip the full-graph 1000-neg eval pass')
     p.add_argument('--full-graph-eval-max-nodes', type=int,
                    default=DEFAULT_CONFIG['full_graph_eval_max_nodes'])
+    # I/O
     p.add_argument('--no-save', action='store_true',
                    help='Do not write full_results.json')
     p.add_argument('--smoke', action='store_true',
-                   help='Tiny smoke test: search=2, finetune=4, edges=512. '
+                   help='Tiny smoke test: short epochs, small batch. '
                         'Verifies the pipeline runs end-to-end on this machine.')
     p.add_argument('--cache-root', default=DEFAULT_CONFIG['cache_root'])
     p.add_argument('--results-root', default=DEFAULT_CONFIG['results_root'])
@@ -86,6 +113,12 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     overrides = {
+        'encoder_type': args.encoder,
+        'gat_heads': args.gat_heads,
+        'train_mode': args.train_mode,
+        'joint_epochs': args.joint_epochs,
+        'joint_patience': args.joint_patience,
+        'joint_entropy_coeff_start': args.entropy_coeff,
         'search_epochs': args.search_epochs,
         'finetune_epochs': args.finetune_epochs,
         'hidden_channels': args.hidden,
@@ -102,21 +135,22 @@ def main():
 
     if args.smoke:
         overrides.update({
+            'joint_epochs': 4,
+            'joint_patience': 4,
+            'joint_eval_steps': 1,
             'search_epochs': 2,
             'finetune_epochs': 4,
             'edges_per_search_epoch': 512,
             'finetune_patience': 4,
             'search_val_every': 1,
             'finetune_eval_steps': 1,
-            'save_results': False,  # don't pollute results/
+            'save_results': False,
         })
         print('[SMOKE] Reduced epochs/edges; not writing JSON.')
 
-    print(f'[run_lppr] dataset={args.dataset} '
-          f'device={args.device or "auto"} seed={args.seed}')
-    print(f'[run_lppr] search_epochs={overrides["search_epochs"]} '
-          f'finetune_epochs={overrides["finetune_epochs"]} '
-          f'push_epsilon={overrides["push_epsilon"]}')
+    print(f'[run_lppr] dataset={args.dataset} encoder={args.encoder} '
+          f'train_mode={args.train_mode} device={args.device or "auto"} '
+          f'seed={args.seed} push_epsilon={overrides["push_epsilon"]}')
 
     result = run_one(
         dataset_name=args.dataset,

@@ -1,5 +1,5 @@
 """
-Option A benchmark runner.
+LPPR benchmark runner.
 
 Unified PS2-style learnable PPR: soft PPR adjacency within subgraphs.
 - Selector (theta) trained on val loss
@@ -23,9 +23,9 @@ from tqdm import tqdm
 
 from ..benchmark.data_prep import prepare_planetoid_data
 from .multi_scale_ppr import MultiScalePPR
-from .option_a_model import OptionAGNN, PPRScaleSelector
-from .option_a_extractor import OptionAExtractor, build_or_load_cache, sample_neg_subgraphs
-from .option_a_searcher import OptionASearcher
+from .option_a_model import LPPRGNN, PPRScaleSelector
+from .option_a_extractor import LPPRSubgraphExtractor, build_or_load_cache, sample_neg_subgraphs
+from .option_a_searcher import LPPRSearcher
 from .artifacts import save_learnable_ppr_experiment
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,22 @@ DEFAULT_CONFIG = {
     'temperature_end': 0.2,
     'edges_per_search_epoch': 10_000,
     'search_val_every': 5,
-    # Fine-tune
+    # Training mode: 'joint' = single-phase, selector + encoder + predictor
+    # trained together on train loss with entropy bonus (Sam's Q3, recommended
+    # for ≤10k node graphs per Zela et al. ICLR'20). 'bilevel' = the original
+    # PS2-style θ-on-val/w-on-train alternation. 'auto' picks joint when
+    # data.num_nodes <= train_mode_auto_threshold, else bilevel.
+    'train_mode': 'auto',
+    'train_mode_auto_threshold': 10_000,
+    # Joint training
+    'joint_epochs': 200,
+    'joint_batch_size': 32,
+    'joint_lr': 0.005,
+    'joint_patience': 30,
+    'joint_eval_steps': 5,
+    'joint_entropy_coeff_start': 1e-2,
+    'joint_entropy_coeff_end': 0.0,
+    # Fine-tune (bilevel mode only)
     'finetune_epochs': 100,
     'finetune_batch_size': 32,
     'finetune_lr': 0.005,
@@ -60,6 +75,11 @@ DEFAULT_CONFIG = {
     'finetune_eval_steps': 5,
     'weight_decay': 1e-5,
     'grad_clip': 1.0,
+    # Encoder backbone (PS2-style apples-to-apples vs baselines).
+    # GCN/SAGE/GAT use the standard backbones operating on P_soft as adjacency.
+    # PPRDiff is the original `h = W(P_soft @ h)` propagation (kept for ablation).
+    'encoder_type': 'GCN',
+    'gat_heads': 4,
     # PPR / extraction
     'teleport_values': [0.90, 0.50, 0.15],   # classic restart (high=local); empirical sizes ~12/42/98 at τ=1e-3
     # Coarse-coarse eps: same precision for train pos cache AND live negs+val
@@ -86,12 +106,12 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_option_a(model, selector, extractor, multi_scale_ppr,
+def evaluate_lppr_per_subgraph(model, selector, extractor, multi_scale_ppr,
                       data, split_edge, split='valid',
                       batch_size=32, device='cpu',
                       K_values=None, max_neg_per_pos=1000):
     """
-    Per-subgraph evaluation for Option A.
+    Per-subgraph evaluation for LPPR.
 
     For each positive edge (u,v): extract subgraph, run model, get score.
     For each negative (u, neg_j): same.
@@ -172,7 +192,7 @@ def evaluate_option_a(model, selector, extractor, multi_scale_ppr,
 
 
 @torch.no_grad()
-def evaluate_option_a_full_graph(model, selector, multi_scale_ppr,
+def evaluate_lppr_full_graph(model, selector, multi_scale_ppr,
                                  data, split_edge, split='test',
                                  batch_size=2048, device='cpu',
                                  K_values=None, max_nodes=8000):
@@ -281,14 +301,14 @@ def evaluate_option_a_full_graph(model, selector, multi_scale_ppr,
 # Fine-tuning with frozen selector
 # ---------------------------------------------------------------------------
 
-def finetune_option_a(model, selector, extractor, multi_scale_ppr,
+def finetune_lppr(model, selector, extractor, multi_scale_ppr,
                       data, split_edge, train_cache,
                       epochs=100, batch_size=32, lr=0.005,
                       weight_decay=1e-5, grad_clip=1.0, patience=20,
                       eval_steps=5, device='cpu', verbose=True,
                       checkpoint_dir=None, neg_extractor=None):
     """
-    Fine-tune OptionAGNN with frozen selector (hard alpha selection).
+    Fine-tune LPPRGNN with frozen selector (hard alpha selection).
 
     The selector is set to eval mode (hard argmax) and NOT updated.
     Only model (encoder + predictor) weights are trained.
@@ -426,13 +446,187 @@ def finetune_option_a(model, selector, extractor, multi_scale_ppr,
 
 
 # ---------------------------------------------------------------------------
+# Joint training: single-phase, selector + encoder + predictor on train loss
+# with annealed entropy bonus. Recommended for small graphs (≤10k nodes) per
+# Sam's Q3 (Zela et al. ICLR'20). Avoids bi-level's failure mode where Phase 1
+# search loss stalls at chance because val signal is too weak.
+# ---------------------------------------------------------------------------
+
+def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
+                     data, split_edge, train_cache,
+                     epochs=200, batch_size=32, lr=0.005,
+                     entropy_coeff_start=1e-2, entropy_coeff_end=0.0,
+                     temperature_start=1.0, temperature_end=0.2,
+                     weight_decay=1e-5, grad_clip=1.0, patience=30,
+                     eval_steps=5, device='cpu', verbose=True,
+                     neg_extractor=None):
+    """
+    Joint single-phase training. Returns the same history schema as
+    finetune_lppr (train_loss, val_loss, best_*, stopped_early, total_time)
+    plus selector diagnostics (entropy, top1_mass, alpha_distribution).
+    """
+    from torch_geometric.utils import negative_sampling, add_self_loops
+
+    _neg_ext = neg_extractor if neg_extractor is not None else extractor
+
+    model.to(device)
+    selector.to(device)
+
+    # Single optimizer over BOTH model and selector
+    params = list(model.parameters()) + list(selector.parameters())
+    optimizer = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    ppr_dense = multi_scale_ppr.ppr_dense
+    x_full = data.x.float().to(device)
+
+    train_src = split_edge['train']['source_node'].to(device)
+    train_dst = split_edge['train']['target_node'].to(device)
+    pos_edge = torch.stack([train_src, train_dst], dim=0)
+    neg_idx, _ = add_self_loops(pos_edge)
+    neg_idx = neg_idx.to(device)
+
+    n_train = len(train_cache)
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'best_val_loss': float('inf'), 'best_epoch': 0,
+        'stopped_early': False, 'total_time': 0.0,
+        'temperature': [], 'entropy_coeff': [],
+        'arch_entropy': [], 'top1_mass': [],
+    }
+    best_val = float('inf')
+    no_improve = 0
+    best_state = None
+    _start = time.time()
+
+    iterator = (tqdm(range(1, epochs + 1), desc='LPPR Joint', mininterval=10)
+                if verbose else range(1, epochs + 1))
+
+    for epoch in iterator:
+        # Anneal temperature and entropy coefficient linearly
+        frac = (epoch - 1) / max(epochs - 1, 1)
+        temp = temperature_start + frac * (temperature_end - temperature_start)
+        ent_c = entropy_coeff_start + frac * (entropy_coeff_end - entropy_coeff_start)
+        selector.set_temperature(temp)
+        history['temperature'].append(temp)
+        history['entropy_coeff'].append(ent_c)
+
+        model.train()
+        selector.train()
+        indices = torch.randperm(n_train)
+        epoch_loss = 0.0
+        ent_acc = 0.0
+        top1_acc = 0.0
+        steps = 0
+
+        for perm in DataLoader(indices.tolist(), batch_size, shuffle=False):
+            pos_subs = [train_cache[i] for i in perm]
+            train_edge = torch.stack(
+                [train_src[perm], train_dst[perm]], dim=0)
+            train_neg = negative_sampling(
+                neg_idx, num_nodes=data.num_nodes,
+                num_neg_samples=len(perm)).to(device)
+            neg_subs = sample_neg_subgraphs(_neg_ext, train_neg)
+
+            optimizer.zero_grad()
+            loss, aux = model.compute_loss(
+                selector, train_edge, train_neg, x_full,
+                ppr_dense, pos_subs, neg_subs,
+                entropy_coeff=ent_c, return_aux=True)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
+            loss.backward()
+            if grad_clip:
+                nn.utils.clip_grad_norm_(params, grad_clip)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            if aux['entropy'] is not None:
+                ent_acc += aux['entropy'].item()
+            # top-1 mass on positives
+            top1_acc += aux['w_pos_mean'].max().item()
+            steps += 1
+
+        avg_loss = epoch_loss / max(steps, 1)
+        avg_ent = ent_acc / max(steps, 1)
+        avg_top1 = top1_acc / max(steps, 1)
+        history['train_loss'].append(avg_loss)
+        history['arch_entropy'].append(avg_ent)
+        history['top1_mass'].append(avg_top1)
+
+        if epoch % eval_steps == 0 or epoch == epochs:
+            model.eval()
+            selector.eval()
+            with torch.no_grad():
+                val_src = split_edge['valid']['source_node'].to(device)
+                val_dst = split_edge['valid']['target_node'].to(device)
+                n_val_sample = min(256, val_src.size(0))
+                vi = torch.randperm(val_src.size(0))[:n_val_sample]
+                val_edge = torch.stack([val_src[vi], val_dst[vi]], dim=0)
+                val_neg = negative_sampling(
+                    neg_idx, num_nodes=data.num_nodes,
+                    num_neg_samples=n_val_sample).to(device)
+                vp_subs = sample_neg_subgraphs(_neg_ext, val_edge)
+                vn_subs = sample_neg_subgraphs(_neg_ext, val_neg)
+                # No entropy term for val loss — we want raw model fit
+                vl = model.compute_loss(
+                    selector, val_edge, val_neg, x_full,
+                    ppr_dense, vp_subs, vn_subs).item()
+
+            history['val_loss'].append(vl)
+
+            if vl < best_val - 1e-4:
+                best_val = vl
+                history['best_val_loss'] = best_val
+                history['best_epoch'] = epoch
+                no_improve = 0
+                best_state = {
+                    'model': copy.deepcopy(model.state_dict()),
+                    'selector': copy.deepcopy(selector.state_dict()),
+                }
+            else:
+                no_improve += eval_steps
+
+            if verbose:
+                iterator.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'val': f'{vl:.4f}',
+                    'best': f'{best_val:.4f}',
+                    'tau': f'{temp:.2f}',
+                    'H': f'{avg_ent:.2f}',
+                    'top1': f'{avg_top1:.2f}',
+                    'pat': f'{no_improve}/{patience}',
+                })
+
+            if no_improve >= patience:
+                history['stopped_early'] = True
+                if verbose:
+                    print(f'\n[Early Stop] epoch {epoch}')
+                break
+
+        scheduler.step()
+
+    history['total_time'] = time.time() - _start
+
+    if best_state:
+        model.load_state_dict(best_state['model'])
+        selector.load_state_dict(best_state['selector'])
+        if verbose:
+            print(f'Restored best from epoch {history["best_epoch"]}')
+
+    return history
+
+
+# ---------------------------------------------------------------------------
 # Main experiment runner
 # ---------------------------------------------------------------------------
 
-def run_option_a_experiment(dataset_name, dataset_path, config,
+def run_lppr_experiment(dataset_name, dataset_path, config,
                             device='cuda'):
     tqdm.write(f"\n{'=' * 70}")
-    tqdm.write(f"Option A: {dataset_name}")
+    tqdm.write(f"LPPR: {dataset_name}")
     tqdm.write(f"Teleport values: {config['teleport_values']}")
     tqdm.write(f"Extraction alpha: {config['extraction_alpha']}, tau: {config['score_tau']}")
 
@@ -467,7 +661,7 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
     tqdm.write(f'  {multi_scale_ppr}')
 
     # ---- Extractor + subgraph caches ----------------------------------------
-    extractor = OptionAExtractor(
+    extractor = LPPRSubgraphExtractor(
         data,
         push_epsilon=config['push_epsilon'],
         score_tau=config['score_tau'],
@@ -487,14 +681,17 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
 
     # ---- Model & Selector ---------------------------------------------------
     feat_dim = data.x.size(1)
-    model = OptionAGNN(
+    encoder_type = config.get('encoder_type', 'GCN')
+    model = LPPRGNN(
         feat_dim=feat_dim,
         hidden_channels=config['hidden_channels'],
         num_layers=config['num_layers'],
         dropout=config['dropout'],
         alphas=config['teleport_values'],
         selector_hidden=config['selector_hidden'],
-        selector_layers=config['selector_layers'])
+        selector_layers=config['selector_layers'],
+        encoder_type=encoder_type,
+        gat_heads=config.get('gat_heads', 4))
 
     selector = PPRScaleSelector(
         in_channels=feat_dim,
@@ -504,69 +701,114 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
         temperature=config['temperature_start'],
         scale_emb_dim=config.get('selector_scale_emb_dim', 32))
 
-    tqdm.write(f'  OptionAGNN params: {sum(p.numel() for p in model.parameters()):,}')
+    tqdm.write(f'  Encoder type: {encoder_type}')
+    tqdm.write(f'  LPPRGNN params: {sum(p.numel() for p in model.parameters()):,}')
     tqdm.write(f'  PPRScaleSelector params: {sum(p.numel() for p in selector.parameters()):,}')
 
-    # ---- Architecture search ------------------------------------------------
-    tqdm.write('\n[Phase 1] Bi-level architecture search...')
-    searcher = OptionASearcher(
-        model=model,
-        selector=selector,
-        multi_scale_ppr=multi_scale_ppr,
-        data=data,
-        split_edge=split_edge,
-        extractor=extractor,
-        train_cache=train_cache,
-        device=device,
-        lr=config['search_lr'],
-        lr_selector=config['search_lr_selector'],
-        lr_min=config['search_lr_min'],
-        temperature_start=config['temperature_start'],
-        temperature_end=config['temperature_end'],
-        edges_per_epoch=config['edges_per_search_epoch'])
+    # ---- Resolve train mode -------------------------------------------------
+    train_mode = config.get('train_mode', 'auto')
+    if train_mode == 'auto':
+        threshold = config.get('train_mode_auto_threshold', 10_000)
+        train_mode = 'joint' if data.num_nodes <= threshold else 'bilevel'
+        tqdm.write(f'  [auto] train_mode resolved to "{train_mode}" '
+                   f'(N={data.num_nodes} vs threshold {threshold})')
+    else:
+        tqdm.write(f'  train_mode = "{train_mode}"')
 
-    search_history = searcher.search(
-        epochs=config['search_epochs'],
-        batch_size=config['search_batch_size'],
-        val_every=config['search_val_every'])
-
-    # Alpha distribution after search
+    search_history = {'total_time': 0.0, 'best_val_loss': 0.0, 'best_epoch': 0}
     alpha_counts = torch.zeros(len(config['teleport_values']), dtype=torch.long)
-    with torch.no_grad():
-        alpha_indices = searcher.get_edge_alpha_indices('train')
-        for k in range(len(config['teleport_values'])):
-            alpha_counts[k] = (alpha_indices == k).sum()
+
+    if train_mode == 'joint':
+        # ---- Joint training (single phase) ------------------------------
+        tqdm.write('\n[Joint training] selector + encoder + predictor on train loss + entropy bonus')
+        finetune_history = train_lppr_joint(
+            model=model,
+            selector=selector,
+            extractor=extractor,
+            multi_scale_ppr=multi_scale_ppr,
+            data=data,
+            split_edge=split_edge,
+            train_cache=train_cache,
+            epochs=config.get('joint_epochs', 200),
+            batch_size=config.get('joint_batch_size', 32),
+            lr=config.get('joint_lr', 0.005),
+            entropy_coeff_start=config.get('joint_entropy_coeff_start', 1e-2),
+            entropy_coeff_end=config.get('joint_entropy_coeff_end', 0.0),
+            temperature_start=config['temperature_start'],
+            temperature_end=config['temperature_end'],
+            weight_decay=config['weight_decay'],
+            grad_clip=config['grad_clip'],
+            patience=config.get('joint_patience', 30),
+            eval_steps=config.get('joint_eval_steps', 5),
+            device=device,
+            verbose=True)
+        # Final alpha distribution from the trained selector
+        with torch.no_grad():
+            train_src = split_edge['train']['source_node'].to(device)
+            train_dst = split_edge['train']['target_node'].to(device)
+            x_full = data.x.float().to(device)
+            cross = model.compute_selector_input(
+                train_src, train_dst, x_full,
+                multi_scale_ppr.ppr_dense, model.alphas)
+            indices = selector.get_alpha_indices(cross).cpu()
+            for k in range(len(config['teleport_values'])):
+                alpha_counts[k] = (indices == k).sum()
+    else:
+        # ---- Bi-level (Phase 1: search, Phase 2: finetune) --------------
+        tqdm.write('\n[Phase 1] Bi-level architecture search...')
+        searcher = LPPRSearcher(
+            model=model,
+            selector=selector,
+            multi_scale_ppr=multi_scale_ppr,
+            data=data,
+            split_edge=split_edge,
+            extractor=extractor,
+            train_cache=train_cache,
+            device=device,
+            lr=config['search_lr'],
+            lr_selector=config['search_lr_selector'],
+            lr_min=config['search_lr_min'],
+            temperature_start=config['temperature_start'],
+            temperature_end=config['temperature_end'],
+            edges_per_epoch=config['edges_per_search_epoch'])
+        search_history = searcher.search(
+            epochs=config['search_epochs'],
+            batch_size=config['search_batch_size'],
+            val_every=config['search_val_every'])
+        with torch.no_grad():
+            alpha_indices = searcher.get_edge_alpha_indices('train')
+            for k in range(len(config['teleport_values'])):
+                alpha_counts[k] = (alpha_indices == k).sum()
+
+        tqdm.write('\n[Phase 2] Fine-tuning with frozen selector...')
+        finetune_history = finetune_lppr(
+            model=model,
+            selector=selector,
+            extractor=extractor,
+            multi_scale_ppr=multi_scale_ppr,
+            data=data,
+            split_edge=split_edge,
+            train_cache=train_cache,
+            epochs=config['finetune_epochs'],
+            batch_size=config['finetune_batch_size'],
+            lr=config['finetune_lr'],
+            weight_decay=config['weight_decay'],
+            grad_clip=config['grad_clip'],
+            patience=config['finetune_patience'],
+            eval_steps=config['finetune_eval_steps'],
+            device=device,
+            verbose=True)
     tqdm.write(f'  Alpha distribution (train): {alpha_counts.tolist()}')
     tqdm.write(f'  Dominant alpha: {config["teleport_values"][alpha_counts.argmax()]}')
 
-    # ---- Fine-tuning --------------------------------------------------------
-    tqdm.write('\n[Phase 2] Fine-tuning with frozen selector...')
-    finetune_history = finetune_option_a(
-        model=model,
-        selector=selector,
-        extractor=extractor,
-        multi_scale_ppr=multi_scale_ppr,
-        data=data,
-        split_edge=split_edge,
-        train_cache=train_cache,
-        epochs=config['finetune_epochs'],
-        batch_size=config['finetune_batch_size'],
-        lr=config['finetune_lr'],
-        weight_decay=config['weight_decay'],
-        grad_clip=config['grad_clip'],
-        patience=config['finetune_patience'],
-        eval_steps=config['finetune_eval_steps'],
-        device=device,
-        verbose=True)
-
     # ---- Evaluation ---------------------------------------------------------
     tqdm.write('\n[Eval] Running per-subgraph evaluation (100-neg)...')
-    val_subgraph = evaluate_option_a(
+    val_subgraph = evaluate_lppr_per_subgraph(
         model, selector, extractor, multi_scale_ppr,
         data, split_edge, split='valid',
         batch_size=config['search_batch_size'], device=device,
         max_neg_per_pos=100)
-    test_subgraph = evaluate_option_a(
+    test_subgraph = evaluate_lppr_per_subgraph(
         model, selector, extractor, multi_scale_ppr,
         data, split_edge, split='test',
         batch_size=config['search_batch_size'], device=device,
@@ -581,10 +823,10 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
     if config.get('full_graph_eval', True):
         tqdm.write('\n[Eval] Running full-graph evaluation (1000-neg)...')
         max_nodes = config.get('full_graph_eval_max_nodes', 8000)
-        val_full = evaluate_option_a_full_graph(
+        val_full = evaluate_lppr_full_graph(
             model, selector, multi_scale_ppr, data, split_edge,
             split='valid', device=device, max_nodes=max_nodes)
-        test_full = evaluate_option_a_full_graph(
+        test_full = evaluate_lppr_full_graph(
             model, selector, multi_scale_ppr, data, split_edge,
             split='test', device=device, max_nodes=max_nodes)
         if test_full is not None:
@@ -599,8 +841,9 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
 
     result = {
         'dataset': dataset_name,
-        'encoder': 'PPRDiff',
-        'method': 'Option A',
+        'encoder': encoder_type,
+        'method': 'LPPR',
+        'train_mode': train_mode,
         'eval_mode': 'full-graph' if test_full is not None else 'per-subgraph',
         'val_results': headline_val,
         'test_results': headline_test,
@@ -630,18 +873,17 @@ def run_option_a_experiment(dataset_name, dataset_path, config,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
 
-    # Save JSON if requested
+    # Save JSON if requested. Path includes encoder so multiple encoders on the
+    # same dataset don't overwrite each other.
     if config.get('save_results', False):
         results_root = config.get('results_root', 'results/benchmark-option-a')
-        save_dir = os.path.join(results_root, dataset_name)
+        save_dir = os.path.join(results_root, dataset_name, encoder_type)
         run_dir = os.path.join(save_dir, 'runs', result['run_id'])
         os.makedirs(run_dir, exist_ok=True)
         for p in [os.path.join(run_dir, 'full_results.json'),
                   os.path.join(save_dir, 'full_results.json')]:
             with open(p, 'w') as f:
-                json.dump({k: v for k, v in result.items()
-                           if k not in ('config',) or True}, f,
-                          indent=2, default=str)
+                json.dump(result, f, indent=2, default=str)
         tqdm.write(f'\nSaved: {save_dir}/full_results.json')
 
     return result
@@ -666,11 +908,11 @@ def run_one(dataset_name, dataset_path='data/Planetoid', config=None,
     config.update(overrides)
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    return run_option_a_experiment(dataset_name, dataset_path, config, device=device)
+    return run_lppr_experiment(dataset_name, dataset_path, config, device=device)
 
 
-def run_option_a_benchmark(config=None, device=None):
-    """Entry point: run Option A on all configured datasets."""
+def run_lppr_benchmark(config=None, device=None):
+    """Entry point: run LPPR on all configured datasets."""
     if config is None:
         config = DEFAULT_CONFIG.copy()
     if device is None:
@@ -679,7 +921,7 @@ def run_option_a_benchmark(config=None, device=None):
     results = {}
     for dataset_name in config['datasets']:
         dataset_path = os.path.join('data', 'Planetoid')
-        res = run_option_a_experiment(
+        res = run_lppr_experiment(
             dataset_name, dataset_path, config, device=device)
         results[dataset_name] = res
 
@@ -691,7 +933,7 @@ def run_option_a_benchmark(config=None, device=None):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Option A benchmark')
+    parser = argparse.ArgumentParser(description='LPPR benchmark')
     parser.add_argument('--datasets', nargs='+', default=['Cora'])
     parser.add_argument('--hidden', type=int, default=256)
     parser.add_argument('--layers', type=int, default=3)
@@ -707,4 +949,4 @@ if __name__ == '__main__':
     cfg['search_epochs'] = args.search_epochs
     cfg['finetune_epochs'] = args.finetune_epochs
 
-    run_option_a_benchmark(cfg, device=args.device)
+    run_lppr_benchmark(cfg, device=args.device)

@@ -1,5 +1,5 @@
 """
-Score-threshold PPR subgraph extraction for Option A.
+Score-threshold PPR subgraph extraction for LPPR.
 
 Extracts subgraphs around query pairs (u, v) by:
   1. Running approximate PPR from seed set {u, v} with small epsilon (1e-5)
@@ -23,9 +23,9 @@ from torch_geometric.utils import negative_sampling, add_self_loops
 from ..utils.local_ppr import approximate_ppr, build_sparse_adj
 
 
-class OptionAExtractor:
+class LPPRSubgraphExtractor:
     """
-    Extracts score-threshold PPR subgraphs for Option A.
+    Extracts score-threshold PPR subgraphs for LPPR.
 
     Args:
         data: PyG Data object (full graph)
@@ -73,18 +73,18 @@ class OptionAExtractor:
 # Subgraph cache: extract once, reuse every epoch
 # ---------------------------------------------------------------------------
 
-class OptionASubgraphCache:
+class LPPRSubgraphCache:
     """
-    Pre-extracted Option A subgraphs for one data split.
+    Pre-extracted LPPR subgraphs for one data split.
 
     Stores only (selected_nodes, u_local, v_local) — no edge_index needed
-    since Option A's GNN uses PPR matrices, not structural edges.
+    since LPPR's GNN uses PPR matrices, not structural edges.
 
     Usage::
 
-        cache = OptionASubgraphCache.build(extractor, split_edge, 'train')
+        cache = LPPRSubgraphCache.build(extractor, split_edge, 'train')
         cache.save('cache/train_opt_a.pt')
-        cache = OptionASubgraphCache.load('cache/train_opt_a.pt')
+        cache = LPPRSubgraphCache.load('cache/train_opt_a.pt')
     """
 
     def __init__(self, selected_nodes_list, u_local_list, v_local_list):
@@ -108,7 +108,7 @@ class OptionASubgraphCache:
         sel_list, u_list, v_list = [], [], []
         skipped = 0
 
-        it = tqdm(range(n), desc=f'Caching {split} subgraphs (OptionA)',
+        it = tqdm(range(n), desc=f'Caching {split} subgraphs (LPPR)',
                   mininterval=5) if verbose else range(n)
         for i in it:
             u = source[i].item()
@@ -147,17 +147,17 @@ class OptionASubgraphCache:
 
 def build_or_load_cache(extractor, split_edge, split, cache_dir,
                         verbose=True):
-    """Build an OptionASubgraphCache or load it from disk."""
+    """Build an LPPRSubgraphCache or load it from disk."""
     if cache_dir:
         path = os.path.join(cache_dir, f'{split}_opt_a_subgraphs.pt')
         if os.path.isfile(path):
             if verbose:
                 print(f'[Cache] Loading {split} subgraphs from {path}')
-            return OptionASubgraphCache.load(path)
+            return LPPRSubgraphCache.load(path)
 
     if verbose:
         print(f'[Cache] Extracting {split} subgraphs (one-time cost)...')
-    cache = OptionASubgraphCache.build(extractor, split_edge, split, verbose)
+    cache = LPPRSubgraphCache.build(extractor, split_edge, split, verbose)
 
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)

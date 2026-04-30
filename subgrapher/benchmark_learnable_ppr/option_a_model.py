@@ -1,5 +1,5 @@
 """
-Option A: PS2-style learnable PPR with soft PPR adjacency within subgraphs.
+LPPR: PS2-style learnable PPR with soft PPR adjacency within subgraphs.
 
 Architecture:
   1. Extract subgraph S around (u,v) using score-threshold PPR  (extraction layer)
@@ -63,6 +63,118 @@ class PPRDiffusionEncoder(nn.Module):
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
         return self.layers[-1](x, P_soft)
+
+
+# ---------------------------------------------------------------------------
+# Pluggable backbone encoders that take the LEARNED P_soft as adjacency.
+# This is the apples-to-apples PS2-style framing: same backbone (GCN/SAGE/GAT)
+# as the baselines, with the alpha mixture as the only changed variable.
+# ---------------------------------------------------------------------------
+
+class _DenseGCNLayer(nn.Module):
+    """GCN-style: h_out = (P_soft @ h) W. P_soft already carries sym-norm + I."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.W = nn.Linear(in_channels, out_channels, bias=True)
+    def reset_parameters(self):
+        self.W.reset_parameters()
+    def forward(self, x, P_soft):
+        return self.W(P_soft @ x)
+
+
+class _DenseSAGELayer(nn.Module):
+    """SAGE-style: separate self and neighbor transforms, concatenated."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.W_self = nn.Linear(in_channels, out_channels, bias=True)
+        self.W_neigh = nn.Linear(in_channels, out_channels, bias=False)
+    def reset_parameters(self):
+        self.W_self.reset_parameters()
+        self.W_neigh.reset_parameters()
+    def forward(self, x, P_soft):
+        return self.W_self(x) + self.W_neigh(P_soft @ x)
+
+
+class _DenseGATLayer(nn.Module):
+    """
+    GAT-style: P_soft acts as both an attention mask (where > 0 → eligible) and
+    a soft edge weight that modulates attention magnitude. Single-head; cheap
+    enough for small subgraphs.
+    """
+    def __init__(self, in_channels, out_channels, heads=4, leaky=0.2):
+        super().__init__()
+        assert out_channels % heads == 0, 'out_channels must be divisible by heads'
+        self.heads = heads
+        self.out_per_head = out_channels // heads
+        self.W = nn.Linear(in_channels, out_channels, bias=False)
+        self.a_src = nn.Parameter(torch.empty(heads, self.out_per_head))
+        self.a_dst = nn.Parameter(torch.empty(heads, self.out_per_head))
+        self.leaky = leaky
+        self.reset_parameters()
+    def reset_parameters(self):
+        self.W.reset_parameters()
+        nn.init.xavier_uniform_(self.a_src)
+        nn.init.xavier_uniform_(self.a_dst)
+    def forward(self, x, P_soft):
+        n = x.size(0)
+        h = self.W(x).view(n, self.heads, self.out_per_head)
+        a_src = (h * self.a_src).sum(-1)               # [N, H]
+        a_dst = (h * self.a_dst).sum(-1)               # [N, H]
+        e = a_src.unsqueeze(1) + a_dst.unsqueeze(0)    # [N, N, H]
+        e = F.leaky_relu(e, self.leaky)
+        mask = (P_soft > 0)
+        e = e.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+        attn = F.softmax(e, dim=1)
+        attn = attn * P_soft.unsqueeze(-1)             # weight by P_soft strength
+        out = torch.einsum('ijh,jhf->ihf', attn, h)    # [N, H, F]
+        return out.reshape(n, -1)                       # [N, H*F]
+
+
+class _GenericDenseEncoder(nn.Module):
+    """
+    Stack of homogeneous layers. `layer_cls` is one of the dense layer classes
+    above. P_soft is shared across all layers.
+    """
+    def __init__(self, layer_cls, in_channels, hidden_channels, out_channels,
+                 num_layers, dropout, **layer_kwargs):
+        super().__init__()
+        self.dropout = dropout
+        self.layers = nn.ModuleList()
+        if num_layers == 1:
+            self.layers.append(layer_cls(in_channels, out_channels, **layer_kwargs))
+        else:
+            self.layers.append(layer_cls(in_channels, hidden_channels, **layer_kwargs))
+            for _ in range(num_layers - 2):
+                self.layers.append(layer_cls(hidden_channels, hidden_channels, **layer_kwargs))
+            self.layers.append(layer_cls(hidden_channels, out_channels, **layer_kwargs))
+    def reset_parameters(self):
+        for l in self.layers: l.reset_parameters()
+    def forward(self, x, P_soft):
+        for layer in self.layers[:-1]:
+            x = layer(x, P_soft)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.layers[-1](x, P_soft)
+
+
+def make_lppr_encoder(kind, in_channels, hidden_channels, out_channels,
+                      num_layers, dropout, gat_heads=4):
+    """Factory: build the encoder backbone identified by `kind`."""
+    kind = kind.upper()
+    if kind == 'PPRDIFF':
+        return PPRDiffusionEncoder(in_channels, hidden_channels, out_channels,
+                                   num_layers, dropout)
+    if kind == 'GCN':
+        return _GenericDenseEncoder(_DenseGCNLayer, in_channels, hidden_channels,
+                                    out_channels, num_layers, dropout)
+    if kind == 'SAGE':
+        return _GenericDenseEncoder(_DenseSAGELayer, in_channels, hidden_channels,
+                                    out_channels, num_layers, dropout)
+    if kind == 'GAT':
+        return _GenericDenseEncoder(_DenseGATLayer, in_channels, hidden_channels,
+                                    out_channels, num_layers, dropout, heads=gat_heads)
+    raise ValueError(f"Unknown encoder kind: {kind!r}. "
+                     "Use one of: GCN, SAGE, GAT, PPRDiff.")
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +263,9 @@ class PPRScaleSelector(nn.Module):
 # Main GNN model (the w-parameters in bi-level)
 # ---------------------------------------------------------------------------
 
-class OptionAGNN(nn.Module):
+class LPPRGNN(nn.Module):
     """
-    PPR-diffusion GNN + link predictor for Option A.
+    PPR-diffusion GNN + link predictor for LPPR.
 
     This is the 'model' (w) in bi-level optimization.
     PPRScaleSelector is the 'arch_net' (theta).
@@ -162,16 +274,21 @@ class OptionAGNN(nn.Module):
     """
 
     def __init__(self, feat_dim, hidden_channels, num_layers, dropout,
-                 alphas, selector_hidden=256, selector_layers=3):
+                 alphas, selector_hidden=256, selector_layers=3,
+                 encoder_type='GCN', gat_heads=4):
         super().__init__()
         self.feat_dim = feat_dim
         self.hidden_channels = hidden_channels
         self.alphas = list(alphas)
         self.num_scales = len(alphas)
         self.dropout = dropout
+        self.encoder_type = encoder_type
 
-        self.encoder = PPRDiffusionEncoder(
-            feat_dim, hidden_channels, hidden_channels, num_layers, dropout)
+        # Pluggable backbone (PS2-style: same backbone as the baselines, only
+        # the alpha mixture changes). Default to GCN to match the GCN baseline.
+        self.encoder = make_lppr_encoder(
+            encoder_type, feat_dim, hidden_channels, hidden_channels,
+            num_layers, dropout, gat_heads=gat_heads)
 
         self.pre_mlp_norm = nn.LayerNorm(hidden_channels)
 
@@ -298,7 +415,8 @@ class OptionAGNN(nn.Module):
     # ------------------------------------------------------------------
 
     def compute_loss(self, selector, edges, neg_edges, x_full, ppr_dense,
-                     pos_subgraphs, neg_subgraphs):
+                     pos_subgraphs, neg_subgraphs,
+                     entropy_coeff=0.0, return_aux=False):
         """
         Full loss for a batch using subgraph-level forward passes.
 
@@ -310,12 +428,14 @@ class OptionAGNN(nn.Module):
             ppr_dense: {alpha: [N, N]}
             pos_subgraphs: list of (nodes_S, u_local, v_local) len=B
             neg_subgraphs: list of (nodes_S, u_local, v_local) len=B
+            entropy_coeff: if > 0, subtracts λ·H(w) from the loss to encourage
+                a non-collapsed selector distribution. Used in joint training.
+            return_aux: if True, returns (loss, dict) with diagnostics.
 
         Returns:
-            loss: scalar
+            loss: scalar (or (loss, aux) if return_aux)
         """
         B = edges.size(1)
-        device = x_full.device
 
         cross_pos = self.compute_selector_input(
             edges[0], edges[1], x_full, ppr_dense, self.alphas)
@@ -338,14 +458,28 @@ class OptionAGNN(nn.Module):
                 nodes_S, u_loc, v_loc, x_full, w_neg[i], ppr_dense)
             neg_preds.append(self.predict(h_u.unsqueeze(0), h_v.unsqueeze(0)))
 
-        pos_logits = torch.cat(pos_preds)  # [B, 1] — logits from predict()
+        pos_logits = torch.cat(pos_preds)
         neg_logits = torch.cat(neg_preds)
-
-        # BCEWithLogitsLoss: numerically stable replacement for the previous
-        # sigmoid + manual -log(p) - log(1-p) form.
         all_logits = torch.cat([pos_logits, neg_logits], dim=0)
         all_targets = torch.cat([
             torch.ones_like(pos_logits),
             torch.zeros_like(neg_logits),
         ], dim=0)
-        return F.binary_cross_entropy_with_logits(all_logits, all_targets)
+        bce = F.binary_cross_entropy_with_logits(all_logits, all_targets)
+
+        # Per-edge selector entropy: -sum(w * log w) averaged over (pos+neg).
+        # Joint training subtracts λ·H to keep w from collapsing onto one scale.
+        loss = bce
+        if entropy_coeff != 0.0:
+            w_all = torch.cat([w_pos, w_neg], dim=0)
+            ent = -(w_all * (w_all + 1e-12).log()).sum(dim=-1).mean()
+            loss = loss - entropy_coeff * ent
+        else:
+            ent = None
+
+        if return_aux:
+            return loss, {'bce': bce.detach(),
+                          'entropy': ent.detach() if ent is not None else None,
+                          'w_pos_mean': w_pos.detach().mean(dim=0),
+                          'w_neg_mean': w_neg.detach().mean(dim=0)}
+        return loss
