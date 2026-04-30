@@ -24,7 +24,7 @@ from tqdm import tqdm
 from ..benchmark.data_prep import prepare_planetoid_data
 from .multi_scale_ppr import MultiScalePPR
 from .option_a_model import LPPRGNN, PPRScaleSelector
-from .option_a_extractor import LPPRSubgraphExtractor, build_or_load_cache, sample_neg_subgraphs
+from .option_a_extractor import LPPRSubgraphExtractor, build_or_load_cache, sample_neg_subgraphs  # noqa: F401  (kept for legacy ablation paths)
 from .option_a_searcher import LPPRSearcher
 from .artifacts import save_learnable_ppr_experiment
 
@@ -94,7 +94,10 @@ DEFAULT_CONFIG = {
     'use_checkpoint_cache': True,
     # Full-graph eval (apples-to-apples vs full-graph baselines)
     'full_graph_eval': True,
-    'full_graph_eval_max_nodes': 8000,        # skip on PubMed (~19.7k), runs on Cora/CiteSeer
+    # Default raised to 30000 so PubMed (~19.7k) gets the apples-to-apples
+    # full-graph eval too. Memory: 3 alphas × N² × 4B at float32 — ~4.7 GB on
+    # PubMed, fine on a 24GB+ GPU. Lower this if you OOM.
+    'full_graph_eval_max_nodes': 30000,
     'cache_root': 'cache',                    # repo-root-relative cache layout (subgraph cache)
     'preprocessed_dir': 'preprocessed',       # multi-scale PPR cache (matches notebook)
     'results_root': 'results/benchmark-option-a',
@@ -301,34 +304,26 @@ def evaluate_lppr_full_graph(model, selector, multi_scale_ppr,
 # Fine-tuning with frozen selector
 # ---------------------------------------------------------------------------
 
-def finetune_lppr(model, selector, extractor, multi_scale_ppr,
-                      data, split_edge, train_cache,
-                      epochs=100, batch_size=32, lr=0.005,
-                      weight_decay=1e-5, grad_clip=1.0, patience=20,
-                      eval_steps=5, device='cpu', verbose=True,
-                      checkpoint_dir=None, neg_extractor=None):
+def finetune_lppr(model, selector, multi_scale_ppr,
+                  data, split_edge,
+                  epochs=100, batch_size=512, lr=0.005,
+                  weight_decay=1e-5, grad_clip=1.0, patience=20,
+                  eval_steps=5, device='cpu', verbose=True):
     """
     Fine-tune LPPRGNN with frozen selector (hard alpha selection).
 
-    The selector is set to eval mode (hard argmax) and NOT updated.
-    Only model (encoder + predictor) weights are trained.
+    Full-graph forward — same code path as train_lppr_joint, just with the
+    selector frozen to its hard argmax. No subgraph extraction.
     """
-    from sklearn.metrics import roc_auc_score
     from torch_geometric.utils import negative_sampling, add_self_loops
-
-    _neg_ext = neg_extractor if neg_extractor is not None else extractor
 
     model.to(device)
     selector.to(device)
-    selector.eval()  # hard selection for fine-tuning
-    # Explicitly freeze selector params (PS2 convention). Optimizer is
-    # already scoped to model.parameters() only, but disabling grad here
-    # also saves autograd memory during the train backward.
+    selector.eval()
     for p in selector.parameters():
         p.requires_grad_(False)
 
     ppr_dense = multi_scale_ppr.ppr_dense
-    alphas = model.alphas
     x_full = data.x.float().to(device)
 
     optimizer = torch.optim.Adam(
@@ -341,8 +336,8 @@ def finetune_lppr(model, selector, extractor, multi_scale_ppr,
     pos_edge = torch.stack([train_src, train_dst], dim=0)
     neg_idx, _ = add_self_loops(pos_edge)
     neg_idx = neg_idx.to(device)
+    n_train = train_src.size(0)
 
-    n_train = len(train_cache)
     history = {
         'train_loss': [], 'val_loss': [],
         'best_val_loss': float('inf'), 'best_epoch': 0,
@@ -363,18 +358,15 @@ def finetune_lppr(model, selector, extractor, multi_scale_ppr,
         steps = 0
 
         for perm in DataLoader(indices.tolist(), batch_size, shuffle=False):
-            pos_subs = [train_cache[i] for i in perm]
             train_edge = torch.stack(
                 [train_src[perm], train_dst[perm]], dim=0)
             train_neg = negative_sampling(
                 neg_idx, num_nodes=data.num_nodes,
                 num_neg_samples=len(perm)).to(device)
-            neg_subs = sample_neg_subgraphs(_neg_ext, train_neg)
 
             optimizer.zero_grad()
             loss = model.compute_loss(
-                selector, train_edge, train_neg, x_full,
-                ppr_dense, pos_subs, neg_subs)
+                selector, train_edge, train_neg, x_full, ppr_dense)
 
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
@@ -390,22 +382,18 @@ def finetune_lppr(model, selector, extractor, multi_scale_ppr,
         history['train_loss'].append(avg_loss)
 
         if epoch % eval_steps == 0 or epoch == epochs:
-            # Quick val loss (not full MRR — too slow during training)
             model.eval()
             with torch.no_grad():
                 val_src = split_edge['valid']['source_node'].to(device)
                 val_dst = split_edge['valid']['target_node'].to(device)
-                n_val_sample = min(256, val_src.size(0))
+                n_val_sample = min(512, val_src.size(0))
                 vi = torch.randperm(val_src.size(0))[:n_val_sample]
                 val_edge = torch.stack([val_src[vi], val_dst[vi]], dim=0)
                 val_neg = negative_sampling(
                     neg_idx, num_nodes=data.num_nodes,
                     num_neg_samples=n_val_sample).to(device)
-                vp_subs = sample_neg_subgraphs(_neg_ext, val_edge)
-                vn_subs = sample_neg_subgraphs(_neg_ext, val_neg)
                 vl = model.compute_loss(
-                    selector, val_edge, val_neg, x_full,
-                    ppr_dense, vp_subs, vn_subs).item()
+                    selector, val_edge, val_neg, x_full, ppr_dense).item()
 
             history['val_loss'].append(vl)
             scheduler.step(vl)
@@ -415,9 +403,7 @@ def finetune_lppr(model, selector, extractor, multi_scale_ppr,
                 history['best_val_loss'] = best_val
                 history['best_epoch'] = epoch
                 no_improve = 0
-                best_state = {
-                    'model': copy.deepcopy(model.state_dict()),
-                }
+                best_state = {'model': copy.deepcopy(model.state_dict())}
             else:
                 no_improve += eval_steps
 
@@ -452,27 +438,29 @@ def finetune_lppr(model, selector, extractor, multi_scale_ppr,
 # search loss stalls at chance because val signal is too weak.
 # ---------------------------------------------------------------------------
 
-def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
-                     data, split_edge, train_cache,
-                     epochs=200, batch_size=32, lr=0.005,
-                     entropy_coeff_start=1e-2, entropy_coeff_end=0.0,
+def train_lppr_joint(model, selector, multi_scale_ppr,
+                     data, split_edge,
+                     epochs=200, batch_size=512, lr=0.005,
+                     entropy_coeff_start=1e-2, entropy_coeff_end=1e-3,
                      temperature_start=1.0, temperature_end=0.2,
-                     weight_decay=1e-5, grad_clip=1.0, patience=30,
-                     eval_steps=5, device='cpu', verbose=True,
-                     neg_extractor=None):
+                     weight_decay=5e-4, grad_clip=1.0, patience=30,
+                     eval_steps=5, device='cpu', verbose=True):
     """
-    Joint single-phase training. Returns the same history schema as
-    finetune_lppr (train_loss, val_loss, best_*, stopped_early, total_time)
-    plus selector diagnostics (entropy, top1_mass, alpha_distribution).
+    Joint single-phase training. Full-graph forward with batch-mean selector
+    weights (Sam's #2 fix: encoder sees the full graph, not a tiny extracted
+    subgraph). No subgraph cache, no extractor — just the multi-scale PPR
+    matrices in `multi_scale_ppr.ppr_dense`.
+
+    Defaults updated per Sam's diagnosis:
+      - batch_size: 32 → 512 (full-graph forward → batch can be much larger)
+      - weight_decay: 1e-5 → 5e-4 (Kipf-Welling default; small data needs more reg)
+      - entropy_coeff_end: 0.0 → 1e-3 (don't drop the regulariser to literal zero)
     """
     from torch_geometric.utils import negative_sampling, add_self_loops
-
-    _neg_ext = neg_extractor if neg_extractor is not None else extractor
 
     model.to(device)
     selector.to(device)
 
-    # Single optimizer over BOTH model and selector
     params = list(model.parameters()) + list(selector.parameters())
     optimizer = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -485,8 +473,8 @@ def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
     pos_edge = torch.stack([train_src, train_dst], dim=0)
     neg_idx, _ = add_self_loops(pos_edge)
     neg_idx = neg_idx.to(device)
+    n_train = train_src.size(0)
 
-    n_train = len(train_cache)
     history = {
         'train_loss': [], 'val_loss': [],
         'best_val_loss': float('inf'), 'best_epoch': 0,
@@ -503,7 +491,6 @@ def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
                 if verbose else range(1, epochs + 1))
 
     for epoch in iterator:
-        # Anneal temperature and entropy coefficient linearly
         frac = (epoch - 1) / max(epochs - 1, 1)
         temp = temperature_start + frac * (temperature_end - temperature_start)
         ent_c = entropy_coeff_start + frac * (entropy_coeff_end - entropy_coeff_start)
@@ -520,18 +507,15 @@ def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
         steps = 0
 
         for perm in DataLoader(indices.tolist(), batch_size, shuffle=False):
-            pos_subs = [train_cache[i] for i in perm]
             train_edge = torch.stack(
                 [train_src[perm], train_dst[perm]], dim=0)
             train_neg = negative_sampling(
                 neg_idx, num_nodes=data.num_nodes,
                 num_neg_samples=len(perm)).to(device)
-            neg_subs = sample_neg_subgraphs(_neg_ext, train_neg)
 
             optimizer.zero_grad()
             loss, aux = model.compute_loss(
-                selector, train_edge, train_neg, x_full,
-                ppr_dense, pos_subs, neg_subs,
+                selector, train_edge, train_neg, x_full, ppr_dense,
                 entropy_coeff=ent_c, return_aux=True)
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -545,7 +529,6 @@ def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
             epoch_loss += loss.item()
             if aux['entropy'] is not None:
                 ent_acc += aux['entropy'].item()
-            # top-1 mass on positives
             top1_acc += aux['w_pos_mean'].max().item()
             steps += 1
 
@@ -562,18 +545,14 @@ def train_lppr_joint(model, selector, extractor, multi_scale_ppr,
             with torch.no_grad():
                 val_src = split_edge['valid']['source_node'].to(device)
                 val_dst = split_edge['valid']['target_node'].to(device)
-                n_val_sample = min(256, val_src.size(0))
+                n_val_sample = min(512, val_src.size(0))
                 vi = torch.randperm(val_src.size(0))[:n_val_sample]
                 val_edge = torch.stack([val_src[vi], val_dst[vi]], dim=0)
                 val_neg = negative_sampling(
                     neg_idx, num_nodes=data.num_nodes,
                     num_neg_samples=n_val_sample).to(device)
-                vp_subs = sample_neg_subgraphs(_neg_ext, val_edge)
-                vn_subs = sample_neg_subgraphs(_neg_ext, val_neg)
-                # No entropy term for val loss — we want raw model fit
                 vl = model.compute_loss(
-                    selector, val_edge, val_neg, x_full,
-                    ppr_dense, vp_subs, vn_subs).item()
+                    selector, val_edge, val_neg, x_full, ppr_dense).item()
 
             history['val_loss'].append(vl)
 
@@ -660,24 +639,12 @@ def run_lppr_experiment(dataset_name, dataset_path, config,
         device=gpu_device)
     tqdm.write(f'  {multi_scale_ppr}')
 
-    # ---- Extractor + subgraph caches ----------------------------------------
-    extractor = LPPRSubgraphExtractor(
-        data,
-        push_epsilon=config['push_epsilon'],
-        score_tau=config['score_tau'],
-        extraction_alpha=config['extraction_alpha'])
-
-    cache_dir = None
-    if config.get('use_checkpoint_cache'):
-        # Repo-root-relative cache layout (matches benchmark-ppr / benchmark-khop)
-        cache_dir = os.path.join(
-            config.get('cache_root', 'cache'), 'option-a', dataset_name,
-            f'eps{config["push_epsilon"]}_tau{config["score_tau"]}')
-
-    tqdm.write('Building/loading train subgraph cache...')
-    train_cache = build_or_load_cache(
-        extractor, split_edge, 'train', cache_dir, verbose=True)
-    tqdm.write(f'  Train cache: {len(train_cache)} subgraphs')
+    # ---- Subgraph extraction is no longer used in the primary path --------
+    # Sam's #2: the encoder now operates on the full graph, not on a tiny
+    # extracted subgraph. The score-threshold extractor was the largest
+    # information-loss step and contributed most of the ~0.22 MRR gap vs
+    # GCN-Full-Graph. Cache files under cache/option-a/.../ are now obsolete
+    # for the joint/bilevel paths; they're left on disk for ablation only.
 
     # ---- Model & Selector ---------------------------------------------------
     feat_dim = data.x.size(1)
@@ -719,30 +686,26 @@ def run_lppr_experiment(dataset_name, dataset_path, config,
     alpha_counts = torch.zeros(len(config['teleport_values']), dtype=torch.long)
 
     if train_mode == 'joint':
-        # ---- Joint training (single phase) ------------------------------
-        tqdm.write('\n[Joint training] selector + encoder + predictor on train loss + entropy bonus')
+        tqdm.write('\n[Joint training] full-graph forward, selector + encoder + predictor on train loss + entropy bonus')
         finetune_history = train_lppr_joint(
             model=model,
             selector=selector,
-            extractor=extractor,
             multi_scale_ppr=multi_scale_ppr,
             data=data,
             split_edge=split_edge,
-            train_cache=train_cache,
             epochs=config.get('joint_epochs', 200),
-            batch_size=config.get('joint_batch_size', 32),
+            batch_size=config.get('joint_batch_size', 512),
             lr=config.get('joint_lr', 0.005),
             entropy_coeff_start=config.get('joint_entropy_coeff_start', 1e-2),
-            entropy_coeff_end=config.get('joint_entropy_coeff_end', 0.0),
+            entropy_coeff_end=config.get('joint_entropy_coeff_end', 1e-3),
             temperature_start=config['temperature_start'],
             temperature_end=config['temperature_end'],
-            weight_decay=config['weight_decay'],
+            weight_decay=config.get('weight_decay', 5e-4),
             grad_clip=config['grad_clip'],
             patience=config.get('joint_patience', 30),
             eval_steps=config.get('joint_eval_steps', 5),
             device=device,
             verbose=True)
-        # Final alpha distribution from the trained selector
         with torch.no_grad():
             train_src = split_edge['train']['source_node'].to(device)
             train_dst = split_edge['train']['target_node'].to(device)
@@ -754,16 +717,13 @@ def run_lppr_experiment(dataset_name, dataset_path, config,
             for k in range(len(config['teleport_values'])):
                 alpha_counts[k] = (indices == k).sum()
     else:
-        # ---- Bi-level (Phase 1: search, Phase 2: finetune) --------------
-        tqdm.write('\n[Phase 1] Bi-level architecture search...')
+        tqdm.write('\n[Phase 1] Bi-level architecture search (full-graph forward)...')
         searcher = LPPRSearcher(
             model=model,
             selector=selector,
             multi_scale_ppr=multi_scale_ppr,
             data=data,
             split_edge=split_edge,
-            extractor=extractor,
-            train_cache=train_cache,
             device=device,
             lr=config['search_lr'],
             lr_selector=config['search_lr_selector'],
@@ -780,19 +740,17 @@ def run_lppr_experiment(dataset_name, dataset_path, config,
             for k in range(len(config['teleport_values'])):
                 alpha_counts[k] = (alpha_indices == k).sum()
 
-        tqdm.write('\n[Phase 2] Fine-tuning with frozen selector...')
+        tqdm.write('\n[Phase 2] Fine-tuning with frozen selector (full-graph forward)...')
         finetune_history = finetune_lppr(
             model=model,
             selector=selector,
-            extractor=extractor,
             multi_scale_ppr=multi_scale_ppr,
             data=data,
             split_edge=split_edge,
-            train_cache=train_cache,
             epochs=config['finetune_epochs'],
-            batch_size=config['finetune_batch_size'],
+            batch_size=config.get('finetune_batch_size', 512),
             lr=config['finetune_lr'],
-            weight_decay=config['weight_decay'],
+            weight_decay=config.get('weight_decay', 5e-4),
             grad_clip=config['grad_clip'],
             patience=config['finetune_patience'],
             eval_steps=config['finetune_eval_steps'],
@@ -801,27 +759,13 @@ def run_lppr_experiment(dataset_name, dataset_path, config,
     tqdm.write(f'  Alpha distribution (train): {alpha_counts.tolist()}')
     tqdm.write(f'  Dominant alpha: {config["teleport_values"][alpha_counts.argmax()]}')
 
-    # ---- Evaluation ---------------------------------------------------------
-    tqdm.write('\n[Eval] Running per-subgraph evaluation (100-neg)...')
-    val_subgraph = evaluate_lppr_per_subgraph(
-        model, selector, extractor, multi_scale_ppr,
-        data, split_edge, split='valid',
-        batch_size=config['search_batch_size'], device=device,
-        max_neg_per_pos=100)
-    test_subgraph = evaluate_lppr_per_subgraph(
-        model, selector, extractor, multi_scale_ppr,
-        data, split_edge, split='test',
-        batch_size=config['search_batch_size'], device=device,
-        max_neg_per_pos=100)
-    tqdm.write(f'  [per-subgraph] Val  MRR={val_subgraph["mrr"]:.4f}  '
-               f'AUC={val_subgraph["auc"]:.4f}  AP={val_subgraph["ap"]:.4f}')
-    tqdm.write(f'  [per-subgraph] Test MRR={test_subgraph["mrr"]:.4f}  '
-               f'AUC={test_subgraph["auc"]:.4f}  AP={test_subgraph["ap"]:.4f}')
-
-    # Full-graph eval (apples-to-apples vs Full-Graph / Static-PPR / k-hop)
+    # ---- Evaluation: full-graph 1000-neg only ---------------------------
+    # Per-subgraph eval is dropped — training is now full-graph, so a
+    # per-subgraph eval would be off-distribution and uninformative.
     val_full, test_full = None, None
+    val_subgraph, test_subgraph = None, None  # kept in JSON as null for schema compat
     if config.get('full_graph_eval', True):
-        tqdm.write('\n[Eval] Running full-graph evaluation (1000-neg)...')
+        tqdm.write('\n[Eval] Full-graph evaluation (1000-neg)...')
         max_nodes = config.get('full_graph_eval_max_nodes', 8000)
         val_full = evaluate_lppr_full_graph(
             model, selector, multi_scale_ppr, data, split_edge,

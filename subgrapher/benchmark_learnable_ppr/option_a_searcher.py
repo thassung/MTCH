@@ -18,7 +18,8 @@ from torch.utils.data import DataLoader
 from torch_geometric.utils import negative_sampling, add_self_loops
 from tqdm import tqdm
 
-from .option_a_extractor import LPPRSubgraphCache, sample_neg_subgraphs
+# Subgraph machinery is no longer used in the bilevel search path — kept as
+# importable for legacy ablations (`forward_subgraph` on the model still works).
 
 
 def _concat(xs):
@@ -46,10 +47,10 @@ class LPPRSearcher:
     """
 
     def __init__(self, model, selector, multi_scale_ppr, data, split_edge,
-                 extractor, train_cache, device='cuda',
+                 device='cuda',
                  lr=0.01, lr_selector=3e-4, lr_min=1e-3,
                  temperature_start=1.0, temperature_end=0.2,
-                 edges_per_epoch=None, search_extractor=None):
+                 edges_per_epoch=None):
         self.model = model.to(device)
         self.selector = selector.to(device)
         self.multi_scale_ppr = multi_scale_ppr
@@ -57,12 +58,6 @@ class LPPRSearcher:
         self.alphas = model.alphas
         self.data = data.to(device)
         self.split_edge = split_edge
-        self.extractor = extractor
-        # search_extractor is used for all LIVE extractions during search
-        # (negatives, val positives, val negatives).  Defaults to extractor.
-        # Pass a coarser-epsilon extractor here for a large speed-up.
-        self.search_extractor = search_extractor if search_extractor is not None else extractor
-        self.train_cache = train_cache
         self.device = device
         self.temperature_start = temperature_start
         self.temperature_end = temperature_end
@@ -102,16 +97,10 @@ class LPPRSearcher:
         return self.temperature_start + frac * (
             self.temperature_end - self.temperature_start)
 
-    def _get_subgraphs_from_cache(self, cache, indices):
-        """Retrieve (nodes_S, u_local, v_local) tuples for a batch of indices."""
-        return [cache[i.item()] for i in indices]
-
-    def _compute_loss_batch(self, model, selector, edges, neg_edges,
-                            pos_subs, neg_subs):
+    def _compute_loss_batch(self, model, selector, edges, neg_edges):
         x_full = self.data.x.float()
         return model.compute_loss(
-            selector, edges, neg_edges, x_full,
-            self.ppr_dense, pos_subs, neg_subs)
+            selector, edges, neg_edges, x_full, self.ppr_dense)
 
     def search(self, epochs=50, batch_size=64, verbose=True, val_every=5):
         """
@@ -170,26 +159,14 @@ class LPPRSearcher:
                     [train_src[perm], train_dst[perm]], dim=0)
                 train_neg = self._neg(self._neg_edge_idx, len(perm))
 
-                pos_subs = self._get_subgraphs_from_cache(
-                    self.train_cache, perm)
-                neg_subs = sample_neg_subgraphs(
-                    self.search_extractor, train_neg)
-
                 # ---- Step 1: update selector on val loss (theta step) ----
                 val_perm = val_cycler.next(self.device)
                 val_edge = torch.stack([val_src[val_perm], val_dst[val_perm]], dim=0)
                 val_neg = self._neg(self._neg_val_idx, len(val_perm))
 
-                val_pos_subs = sample_neg_subgraphs(
-                    self.search_extractor, val_edge)
-                val_neg_subs = sample_neg_subgraphs(
-                    self.search_extractor, val_neg)
-
                 self.optimizer_selector.zero_grad()
                 val_loss = self._compute_loss_batch(
-                    self.model, self.selector,
-                    val_edge, val_neg,
-                    val_pos_subs, val_neg_subs)
+                    self.model, self.selector, val_edge, val_neg)
 
                 if not (torch.isnan(val_loss) or torch.isinf(val_loss)):
                     val_loss.backward()
@@ -197,16 +174,9 @@ class LPPRSearcher:
                     self.optimizer_selector.step()
 
                 # ---- Step 2: update model on train loss (w step) ---------
-                # Keep selector in train mode (soft weights) so the GNN always
-                # sees a smooth P_soft mixture — hard argmax during early random
-                # selection would give contradictory gradients across batches.
-                # Selector grads from train_loss are computed but discarded
-                # (only optimizer_model.step() is called).
                 self.optimizer_model.zero_grad()
                 train_loss = self._compute_loss_batch(
-                    self.model, self.selector,
-                    train_edge, train_neg,
-                    pos_subs, neg_subs)
+                    self.model, self.selector, train_edge, train_neg)
 
                 if not (torch.isnan(train_loss) or torch.isinf(train_loss)):
                     train_loss.backward()
@@ -280,7 +250,7 @@ class LPPRSearcher:
         return entropy, top1
 
     @torch.no_grad()
-    def _val_loss(self, batch_size, sample=256):
+    def _val_loss(self, batch_size, sample=512):
         self.model.eval()
         self.selector.eval()
         val_src = self.split_edge['valid']['source_node'].to(self.device)
@@ -289,12 +259,9 @@ class LPPRSearcher:
         idx = torch.randperm(val_src.size(0))[:n]
         edges = torch.stack([val_src[idx], val_dst[idx]], dim=0)
         neg = self._neg(self._neg_val_idx, n)
-        pos_subs = sample_neg_subgraphs(self.extractor, edges)
-        neg_subs = sample_neg_subgraphs(self.extractor, neg)
         x_full = self.data.x.float()
         loss = self.model.compute_loss(
-            self.selector, edges, neg, x_full,
-            self.ppr_dense, pos_subs, neg_subs)
+            self.selector, edges, neg, x_full, self.ppr_dense)
         return loss.item()
 
     @torch.no_grad()

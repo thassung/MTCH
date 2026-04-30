@@ -328,7 +328,14 @@ class LPPRGNN(nn.Module):
         """
         Cross-pair PPR-diffused features for the selector.
 
-        For each alpha k: cross[b,k,:] = (PPR_k[u_b] @ x) * (PPR_k[v_b] @ x)
+        For each alpha k: cross[b,k,:] = (PPR_k[u_b] @ x) * (PPR_k[v_b] @ x),
+        L2-normalized per (b, k).
+
+        The L2-normalization kills the magnitude race between scales (α=0.9
+        is near-one-hot ⇒ cross signal ≈ x[u]⊙x[v], large; α=0.15 averages
+        ~50 nodes ⇒ cross is ~10× smaller per coord). Without normalization the
+        selector picks the largest-magnitude scale at init and rich-get-richer
+        locks it in (Liu et al., DARTS, ICLR'19). One-line fix; mandatory.
 
         Args:
             u_indices: [B] global indices
@@ -338,7 +345,7 @@ class LPPRGNN(nn.Module):
             alphas:    ordered list of alpha values
 
         Returns:
-            [B, num_scales, D]
+            [B, num_scales, D] — each (b, k) row is unit L2 norm
         """
         device = x_full.device
         scale_reprs = []
@@ -348,7 +355,9 @@ class LPPRGNN(nn.Module):
                 mat = mat.to(device, non_blocking=True)
             z_u = mat[u_indices] @ x_full   # [B, D]
             z_v = mat[v_indices] @ x_full   # [B, D]
-            scale_reprs.append(z_u * z_v)
+            cross = z_u * z_v
+            cross = F.normalize(cross, p=2, dim=-1)  # unit L2 per (b, k)
+            scale_reprs.append(cross)
         return torch.stack(scale_reprs, dim=1)  # [B, num_scales, D]
 
     def _build_p_soft(self, nodes_S, weights, ppr_dense, device):
@@ -389,20 +398,40 @@ class LPPRGNN(nn.Module):
             P_soft = P_soft + weights[i] * P_hat
         return P_soft
 
+    def _build_p_soft_full(self, weights, ppr_dense, num_nodes, device):
+        """
+        Full-graph soft PPR adjacency (sym-norm with self-loops, weighted mix).
+
+        Per-scale:  P̂_α = D_α^(-1/2) (I + P_α) D_α^(-1/2)  (full N×N)
+        Mixture:    P_full = Σ_k w_k · P̂_α_k
+
+        Args:
+            weights: [num_scales] single mixture (typically batch-mean)
+            ppr_dense: {alpha: [N, N]}
+            num_nodes: int N
+            device: target device
+
+        Returns:
+            [N, N] full-graph propagator
+        """
+        N = num_nodes
+        eye = torch.eye(N, device=device)
+        P_full = torch.zeros(N, N, device=device)
+        for i, alpha in enumerate(self.alphas):
+            mat = ppr_dense[alpha]
+            P_slice = mat.to(device) if mat.device != device else mat
+            A_tilde = eye + P_slice
+            d_inv_sqrt = A_tilde.sum(dim=1).clamp(min=1e-6).pow(-0.5)
+            P_hat = d_inv_sqrt.unsqueeze(1) * A_tilde * d_inv_sqrt.unsqueeze(0)
+            P_full = P_full + weights[i] * P_hat
+        return P_full
+
     def forward_subgraph(self, nodes_S, u_local, v_local, x_full,
                          weights, ppr_dense):
         """
-        GNN forward for one subgraph.
-
-        Args:
-            nodes_S: [|S|] global node indices
-            u_local, v_local: int, local indices within nodes_S
-            x_full: [N, D]
-            weights: [num_scales] selector output for this edge
-            ppr_dense: {alpha: [N, N]}
-
-        Returns:
-            h_u: [D],  h_v: [D]
+        GNN forward for one subgraph (legacy / ablation path). Kept so the
+        old per-subgraph eval can still run if explicitly requested. The
+        primary training path is forward_full_graph_batch.
         """
         device = x_full.device
         x_S = x_full[nodes_S.to(device)]
@@ -410,56 +439,67 @@ class LPPRGNN(nn.Module):
         h_S = self.encoder(x_S, P_soft)
         return h_S[u_local], h_S[v_local]
 
+    def forward_full_graph_batch(self, edges, neg_edges, x_full,
+                                 w_pos, w_neg, ppr_dense):
+        """
+        Full-graph forward for a batch of (pos, neg) edges.
+
+        Uses batch-mean selector weights to build a single full-graph P_full,
+        runs the encoder once over the entire graph, then indexes h_u / h_v
+        for every edge in the batch.
+
+        This is Sam's #2 fix: encoder now sees the full graph (not a tiny
+        extracted subgraph), so it can't be starved of information by the
+        score-threshold extractor. The selector still gets per-edge gradient
+        via its contribution to the batch-mean mixture and via the entropy
+        term — but the encoder's propagation is shared, which is what makes
+        a single forward per batch tractable on Cora/CiteSeer/PubMed.
+
+        Reference: Bojchevski et al., PPRGo (KDD'20) — full-graph PPR
+        encoding with shared per-batch propagator.
+
+        Returns:
+            (pos_logits [B, 1], neg_logits [B, 1])
+        """
+        # Average weights across pos + neg for ONE shared propagator
+        w_all = torch.cat([w_pos, w_neg], dim=0)  # [2B, num_scales]
+        w_mean = w_all.mean(dim=0)                 # [num_scales]
+        N = x_full.size(0)
+        device = x_full.device
+        P_full = self._build_p_soft_full(w_mean, ppr_dense, N, device)
+        h = self.encoder(x_full, P_full)
+        pos_logits = self.predict(h[edges[0]], h[edges[1]])
+        neg_logits = self.predict(h[neg_edges[0]], h[neg_edges[1]])
+        return pos_logits, neg_logits
+
     # ------------------------------------------------------------------
-    # Loss (called by bi-level searcher and fine-tuner)
+    # Loss
     # ------------------------------------------------------------------
 
     def compute_loss(self, selector, edges, neg_edges, x_full, ppr_dense,
-                     pos_subgraphs, neg_subgraphs,
                      entropy_coeff=0.0, return_aux=False):
         """
-        Full loss for a batch using subgraph-level forward passes.
+        Full-graph batch loss.
 
-        Args:
-            selector: PPRScaleSelector instance
-            edges: [2, B]
-            neg_edges: [2, B]
-            x_full: [N, D]
-            ppr_dense: {alpha: [N, N]}
-            pos_subgraphs: list of (nodes_S, u_local, v_local) len=B
-            neg_subgraphs: list of (nodes_S, u_local, v_local) len=B
-            entropy_coeff: if > 0, subtracts λ·H(w) from the loss to encourage
-                a non-collapsed selector distribution. Used in joint training.
-            return_aux: if True, returns (loss, dict) with diagnostics.
-
-        Returns:
-            loss: scalar (or (loss, aux) if return_aux)
+        Drops the subgraph-extraction code path entirely (Sam's #2). For each
+        batch:
+        1. Selector produces per-edge alpha weights w_pos, w_neg.
+        2. Their batch mean defines a single full-graph P_full.
+        3. Encoder runs ONCE over the entire graph.
+        4. Predictor scores each (u,v) using the indexed h_u, h_v.
+        5. Optional entropy bonus on the per-edge softmax keeps w from
+           collapsing onto a single scale.
         """
-        B = edges.size(1)
-
         cross_pos = self.compute_selector_input(
             edges[0], edges[1], x_full, ppr_dense, self.alphas)
         cross_neg = self.compute_selector_input(
             neg_edges[0], neg_edges[1], x_full, ppr_dense, self.alphas)
-
-        w_pos = selector(cross_pos)  # [B, num_scales]
+        w_pos = selector(cross_pos)
         w_neg = selector(cross_neg)
 
-        pos_preds, neg_preds = [], []
-        for i in range(B):
-            nodes_S, u_loc, v_loc = pos_subgraphs[i]
-            h_u, h_v = self.forward_subgraph(
-                nodes_S, u_loc, v_loc, x_full, w_pos[i], ppr_dense)
-            pos_preds.append(self.predict(h_u.unsqueeze(0), h_v.unsqueeze(0)))
+        pos_logits, neg_logits = self.forward_full_graph_batch(
+            edges, neg_edges, x_full, w_pos, w_neg, ppr_dense)
 
-        for i in range(B):
-            nodes_S, u_loc, v_loc = neg_subgraphs[i]
-            h_u, h_v = self.forward_subgraph(
-                nodes_S, u_loc, v_loc, x_full, w_neg[i], ppr_dense)
-            neg_preds.append(self.predict(h_u.unsqueeze(0), h_v.unsqueeze(0)))
-
-        pos_logits = torch.cat(pos_preds)
-        neg_logits = torch.cat(neg_preds)
         all_logits = torch.cat([pos_logits, neg_logits], dim=0)
         all_targets = torch.cat([
             torch.ones_like(pos_logits),
@@ -467,15 +507,12 @@ class LPPRGNN(nn.Module):
         ], dim=0)
         bce = F.binary_cross_entropy_with_logits(all_logits, all_targets)
 
-        # Per-edge selector entropy: -sum(w * log w) averaged over (pos+neg).
-        # Joint training subtracts λ·H to keep w from collapsing onto one scale.
         loss = bce
+        ent = None
         if entropy_coeff != 0.0:
             w_all = torch.cat([w_pos, w_neg], dim=0)
             ent = -(w_all * (w_all + 1e-12).log()).sum(dim=-1).mean()
             loss = loss - entropy_coeff * ent
-        else:
-            ent = None
 
         if return_aux:
             return loss, {'bce': bce.detach(),
