@@ -199,10 +199,10 @@ class MultiScalePPR:
 
     def get_stats(self):
         """Get memory and cache statistics."""
-        total_cached = sum(p.get_stats()['num_cached']
-                           for p in self.preprocessors.values())
-        total_mb = sum(p.get_stats()['memory_mb']
-                       for p in self.preprocessors.values())
+        # α=0 has no PPRPreprocessor (placeholder None) — skip it
+        live_pps = [p for p in self.preprocessors.values() if p is not None]
+        total_cached = sum(p.get_stats()['num_cached'] for p in live_pps)
+        total_mb = sum(p.get_stats()['memory_mb'] for p in live_pps)
         N = self.num_nodes
         dense_mb = N * N * 4 * self.num_scales / (1024 * 1024)
         return {
