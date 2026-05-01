@@ -21,7 +21,7 @@ from datetime import datetime
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..benchmark.data_prep import prepare_planetoid_data
+from ..benchmark.data_prep import prepare_planetoid_data, prepare_ogbl_link_data
 from .multi_scale_ppr import MultiScalePPR
 from .option_a_model import LPPRGNN, PPRScaleSelector
 from .option_a_extractor import LPPRSubgraphExtractor, build_or_load_cache, sample_neg_subgraphs  # noqa: F401  (kept for legacy ablation paths)
@@ -82,10 +82,14 @@ DEFAULT_CONFIG = {
     'gat_heads': 4,
     # PPR / extraction
     # α=0.0 is the vanilla A_norm fallback — selector can dynamically pick
-    # "use plain GCN-FG propagation" if no PPR alpha helps. Sam's Q4
-    # recommendation: gives the selector an escape hatch when the alpha grid
-    # is structurally inferior for a given dataset/encoder.
-    'teleport_values': [0.90, 0.50, 0.15, 0.0],
+    # "use plain GCN-FG propagation" if no PPR alpha helps. The other alphas
+    # are now CLOSER to vanilla than the original [0.9, 0.5, 0.15] grid:
+    # the previous grid had every PPR option more extreme than vanilla GCN's
+    # ~3-hop receptive field, so the selector always preferred α=0. The new
+    # grid {0.05, 0.15, 0.30} spans diffusion levels that bracket vanilla
+    # GCN's effective receptive field (3-layer GCN ≈ α≈0.20), giving the
+    # selector real options to choose between.
+    'teleport_values': [0.05, 0.15, 0.30, 0.0],
     # Coarse-coarse eps: same precision for train pos cache AND live negs+val
     # avoids the subgraph-size-as-label-leak that asymmetric eps creates.
     # 5e-4 is fast enough to extract live during search/eval.
@@ -105,6 +109,11 @@ DEFAULT_CONFIG = {
     'cache_root': 'cache',                    # repo-root-relative cache layout (subgraph cache)
     'preprocessed_dir': 'preprocessed',       # multi-scale PPR cache (matches notebook)
     'results_root': 'results/benchmark-option-a',
+    # OGB link prediction (e.g. ogbl-ddi). Set max_train_edges to subsample
+    # since ogbl-ddi has 1.07M positives — full set is slow and likely
+    # overkill given our compute budget.
+    'ogb_root': 'data/ogb',
+    'ogb_max_train_edges': 200_000,
 }
 
 
@@ -614,9 +623,17 @@ def run_lppr_experiment(dataset_name, dataset_path, config,
     tqdm.write(f"Extraction alpha: {config['extraction_alpha']}, tau: {config['score_tau']}")
 
     # ---- Data ---------------------------------------------------------------
-    # Use the Planetoid-specific loader (real node features, train/val/test split).
-    # This mirrors what learnable_ppr_planetoid.ipynb does in cell 4.
-    dd = prepare_planetoid_data(dataset_name, root=dataset_path)
+    # Dispatch on dataset name: Planetoid vs OGB link-prediction
+    if dataset_name.startswith('ogbl-'):
+        dd = prepare_ogbl_link_data(
+            name=dataset_name,
+            root=config.get('ogb_root', 'data/ogb'),
+            feature_method=config.get('feature_method', 'random'),
+            feature_dim=config.get('feature_dim', 128),
+            seed=config.get('seed', 42),
+            max_train_edges=config.get('ogb_max_train_edges', 200_000))
+    else:
+        dd = prepare_planetoid_data(dataset_name, root=dataset_path)
     data = dd['data']
     split_edge = dd['split_edge']
     # Swap to train-only edges so val/test edges aren't visible during message passing.

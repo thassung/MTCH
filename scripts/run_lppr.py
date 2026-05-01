@@ -35,8 +35,11 @@ def parse_args():
     p = argparse.ArgumentParser(
         description='Learnable PPR (LPPR) — single-dataset runner')
     p.add_argument('--dataset', required=True,
-                   choices=['Cora', 'CiteSeer', 'PubMed'],
-                   help='Planetoid dataset')
+                   choices=['Cora', 'CiteSeer', 'PubMed', 'ogbl-ddi'],
+                   help='Dataset: Planetoid (Cora/CiteSeer/PubMed) or OGB link prediction (ogbl-ddi)')
+    p.add_argument('--alphas', type=str, default=None,
+                   help='Comma-separated alpha grid (e.g. "0.0,0.05,0.15,0.30"). '
+                        'Overrides DEFAULT_CONFIG.teleport_values. α=0.0 is vanilla A_norm.')
     p.add_argument('--dataset-path', default='data/Planetoid',
                    help='Planetoid root (downloads here on first use)')
     p.add_argument('--device', default=None,
@@ -112,6 +115,11 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    teleport_values = None
+    if args.alphas:
+        teleport_values = [float(x.strip()) for x in args.alphas.split(',')]
+        print(f'[run_lppr] alpha grid override: {teleport_values}')
+
     overrides = {
         'encoder_type': args.encoder,
         'gat_heads': args.gat_heads,
@@ -132,6 +140,8 @@ def main():
         'cache_root': args.cache_root,
         'results_root': args.results_root,
     }
+    if teleport_values is not None:
+        overrides['teleport_values'] = teleport_values
 
     if args.smoke:
         overrides.update({

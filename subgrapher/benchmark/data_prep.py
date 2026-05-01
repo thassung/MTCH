@@ -185,6 +185,101 @@ def prepare_planetoid_data(name, root='data/planetoid', val_ratio=0.1, test_rati
     }
 
 
+def prepare_ogbl_link_data(name='ogbl-ddi', root='data/ogb',
+                            feature_method='random', feature_dim=128,
+                            num_neg_samples_eval=100, seed=42,
+                            max_train_edges=None):
+    """Prepare an OGB link-prediction dataset for our pipeline.
+
+    Returns the same dict shape as `prepare_planetoid_data` (data, split_edge,
+    train_edge_index, feature_dim, ...). We deliberately do NOT use OGB's
+    flat-negative eval format (one shared neg pool per split) — instead we
+    generate per-positive negatives so the metrics are directly comparable to
+    our Planetoid runs. Trade-off: numbers won't match the OGB leaderboard.
+
+    Currently tested for ogbl-ddi (4267 nodes, ~1.3M edges, no node features
+    in raw data — random features added).
+
+    Larger OGB datasets (collab, ppa, citation2) need sparse PPR — out of
+    scope for the current dense-N×N pipeline. They will OOM here.
+
+    Args:
+        name: 'ogbl-ddi' (others may work but untested in this pipeline)
+        root: where to download
+        feature_method: 'random' (default) or 'one_hot' if N small enough
+        feature_dim: random feature dim
+        num_neg_samples_eval: per-positive negatives for val/test
+        seed: reproducibility
+        max_train_edges: subsample train positives to this many (None = all)
+    """
+    from ogb.linkproppred import PygLinkPropPredDataset
+
+    print(f"Loading {name} from OGB...")
+    dataset = PygLinkPropPredDataset(name=name, root=root)
+    data = dataset[0]
+    split_edge_ogb = dataset.get_edge_split()
+
+    data.edge_index = to_undirected(data.edge_index, num_nodes=data.num_nodes)
+    print(f"  Nodes: {data.num_nodes:,}  Edges: {data.edge_index.size(1):,}  "
+          f"raw_features: {data.x is not None}")
+
+    # Add features if missing
+    if data.x is None or data.x.size(1) == 0:
+        data = add_node_features(data, method=feature_method, feature_dim=feature_dim)
+    feature_dim = int(data.x.size(1))
+    print(f"  Final feature_dim: {feature_dim}")
+
+    # Convert OGB's [E, 2] edge tensors to our [2, E] convention
+    train_pos = split_edge_ogb['train']['edge'].t().contiguous()
+    valid_pos = split_edge_ogb['valid']['edge'].t().contiguous()
+    test_pos  = split_edge_ogb['test']['edge'].t().contiguous()
+
+    # Optional: subsample train edges (ogbl-ddi has 1.07M which is a lot)
+    if max_train_edges is not None and train_pos.size(1) > max_train_edges:
+        torch.manual_seed(seed)
+        idx = torch.randperm(train_pos.size(1))[:max_train_edges]
+        train_pos = train_pos[:, idx]
+        print(f"  Subsampled train edges: {train_pos.size(1):,}")
+
+    # Per-positive negatives for val/test (matches our Planetoid eval protocol)
+    torch.manual_seed(seed)
+    val_neg = generate_negative_samples(
+        valid_pos, data.num_nodes,
+        num_neg_samples=valid_pos.size(1) * num_neg_samples_eval)
+    test_neg = generate_negative_samples(
+        test_pos, data.num_nodes,
+        num_neg_samples=test_pos.size(1) * num_neg_samples_eval)
+
+    split_edge = {
+        'train': {
+            'source_node': train_pos[0],
+            'target_node': train_pos[1],
+        },
+        'valid': {
+            'source_node': valid_pos[0],
+            'target_node': valid_pos[1],
+            'target_node_neg': val_neg[1].view(valid_pos.size(1), -1),
+        },
+        'test': {
+            'source_node': test_pos[0],
+            'target_node': test_pos[1],
+            'target_node_neg': test_neg[1].view(test_pos.size(1), -1),
+        },
+    }
+
+    print(f"  Train: {train_pos.size(1):,}  Val: {valid_pos.size(1):,}  "
+          f"Test: {test_pos.size(1):,}")
+
+    return {
+        'data': data,
+        'split_edge': split_edge,
+        'train_edge_index': train_pos,
+        'feature_dim': feature_dim,
+        'node2idx': None,
+        'idx2node': None,
+    }
+
+
 def prepare_link_prediction_data(dataset_path, feature_method='random', feature_dim=128,
                                   val_ratio=0.1, test_ratio=0.1, num_neg_samples_eval=100):
     """
