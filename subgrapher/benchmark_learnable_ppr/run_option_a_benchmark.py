@@ -81,7 +81,11 @@ DEFAULT_CONFIG = {
     'encoder_type': 'GCN',
     'gat_heads': 4,
     # PPR / extraction
-    'teleport_values': [0.90, 0.50, 0.15],   # classic restart (high=local); empirical sizes ~12/42/98 at τ=1e-3
+    # α=0.0 is the vanilla A_norm fallback — selector can dynamically pick
+    # "use plain GCN-FG propagation" if no PPR alpha helps. Sam's Q4
+    # recommendation: gives the selector an escape hatch when the alpha grid
+    # is structurally inferior for a given dataset/encoder.
+    'teleport_values': [0.90, 0.50, 0.15, 0.0],
     # Coarse-coarse eps: same precision for train pos cache AND live negs+val
     # avoids the subgraph-size-as-label-leak that asymmetric eps creates.
     # 5e-4 is fast enough to extract live during search/eval.

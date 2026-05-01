@@ -97,9 +97,22 @@ class _DenseSAGELayer(nn.Module):
 
 class _DenseGATLayer(nn.Module):
     """
-    GAT-style: P_soft acts as both an attention mask (where > 0 → eligible) and
-    a soft edge weight that modulates attention magnitude. Single-head; cheap
-    enough for small subgraphs.
+    GAT-style with P_soft as a log-prior on attention.
+
+    Pre-fix: `attn = attn * P_soft.unsqueeze(-1)` killed the encoder by
+    multiplying softmax outputs by the (typically tiny) P_soft entries for
+    distant nodes — gradients vanished and the model never learned. Cora-GAT
+    sat at val_loss=0.6931 (chance) for 35 epochs.
+
+    Fixed formulation: add `log(P_soft + ε)` to the attention logits BEFORE
+    softmax. Where P_soft is large (close-by under the alpha mixture), the
+    prior boosts attention; where P_soft is small (distant), the prior down-
+    weights attention but doesn't zero gradients. The query-key term can still
+    learn to override the prior when it's wrong.
+
+    Cost: e is [N, N, H] dense — fine for Cora/CiteSeer (~120MB at N=2708);
+    PubMed at N=19717 will need either smaller batch_size for full-graph eval
+    or a sparse fallback (TODO).
     """
     def __init__(self, in_channels, out_channels, heads=4, leaky=0.2):
         super().__init__()
@@ -118,16 +131,17 @@ class _DenseGATLayer(nn.Module):
     def forward(self, x, P_soft):
         n = x.size(0)
         h = self.W(x).view(n, self.heads, self.out_per_head)
-        a_src = (h * self.a_src).sum(-1)               # [N, H]
-        a_dst = (h * self.a_dst).sum(-1)               # [N, H]
-        e = a_src.unsqueeze(1) + a_dst.unsqueeze(0)    # [N, N, H]
+        a_src = (h * self.a_src).sum(-1)                   # [N, H]
+        a_dst = (h * self.a_dst).sum(-1)                   # [N, H]
+        e = a_src.unsqueeze(1) + a_dst.unsqueeze(0)        # [N, N, H]
         e = F.leaky_relu(e, self.leaky)
-        mask = (P_soft > 0)
-        e = e.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+        # P_soft as a log-prior on attention. log(eps) for zero entries gives
+        # them a strong negative bias but keeps the gradient path alive.
+        log_prior = torch.log(P_soft.clamp(min=1e-6))      # [N, N]
+        e = e + log_prior.unsqueeze(-1)                    # broadcast over heads
         attn = F.softmax(e, dim=1)
-        attn = attn * P_soft.unsqueeze(-1)             # weight by P_soft strength
-        out = torch.einsum('ijh,jhf->ihf', attn, h)    # [N, H, F]
-        return out.reshape(n, -1)                       # [N, H*F]
+        out = torch.einsum('ijh,jhf->ihf', attn, h)        # [N, H, F]
+        return out.reshape(n, -1)                           # [N, H*F]
 
 
 class _GenericDenseEncoder(nn.Module):

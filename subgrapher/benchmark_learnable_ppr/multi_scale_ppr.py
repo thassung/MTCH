@@ -34,18 +34,31 @@ class MultiScalePPR:
         self.preprocessors = {}
         self._load_all(dataset_name, data, preprocessed_dir)
 
-        self.num_nodes = next(iter(self.preprocessors.values())).num_nodes
-
         self.config_labels = []
         for si in self.teleport_values:
             for sj in self.teleport_values:
                 self.config_labels.append((si, sj))
 
+        # _build_dense sets self.num_nodes (handles α=0 specially)
         self._build_dense(device)
 
     def _load_all(self, dataset_name, data, preprocessed_dir):
-        """Load preprocessors for each teleport value."""
+        """Load preprocessors for each teleport value.
+
+        α=0.0 is a special value: no PPR computation needed — the propagator
+        is the vanilla normalized adjacency D^(-1/2) (I + A) D^(-1/2). It's
+        kept in `self.preprocessors` as a marker, but the actual matrix is
+        constructed in `_build_dense` directly from `data.edge_index`.
+        """
+        self._raw_data = data
         for alpha in self.teleport_values:
+            if alpha == 0.0:
+                # Vanilla A_norm fallback — no PPR file required
+                self.preprocessors[alpha] = None
+                if data is None:
+                    raise ValueError(
+                        "alpha=0.0 (vanilla A_norm) requires `data=` to be passed.")
+                continue
             path = os.path.join(preprocessed_dir, dataset_name,
                                 f'ppr_alpha{alpha}.pt')
             if os.path.exists(path):
@@ -66,13 +79,39 @@ class MultiScalePPR:
                 )
 
     def _build_dense(self, device):
-        """Pre-stack all PPR vectors into dense [N, N] tensors for O(1) batch lookup."""
+        """Pre-stack all PPR vectors into dense [N, N] tensors for O(1) batch lookup.
+
+        For α=0.0, the matrix stored is the RAW symmetric adjacency `A` (no
+        self-loops; downstream `_build_p_soft_full` adds I and sym-norms). This
+        gives the selector a "use vanilla GCN propagation" option in addition
+        to the PPR alphas.
+        """
+        from torch_geometric.utils import to_dense_adj
+
+        # Resolve N from any non-α=0 preprocessor, falling back to data
+        non_zero_alpha = next((a for a in self.teleport_values if a != 0.0), None)
+        if non_zero_alpha is not None:
+            N = self.preprocessors[non_zero_alpha].num_nodes
+        elif self._raw_data is not None:
+            N = int(self._raw_data.num_nodes)
+        else:
+            raise RuntimeError("Cannot determine number of nodes for MultiScalePPR.")
+        self.num_nodes = N
+
         self.ppr_dense = {}
-        N = self.num_nodes
         print(f"  Building dense PPR matrices ({N}x{N} x {self.num_scales} scales)...")
         for alpha in self.teleport_values:
-            pp = self.preprocessors[alpha]
-            mat = torch.stack([pp.get_ppr(i) for i in range(N)])  # [N, N]
+            if alpha == 0.0:
+                # Raw symmetric adjacency — vanilla A_norm path
+                A = to_dense_adj(
+                    self._raw_data.edge_index, max_num_nodes=N
+                ).squeeze(0).float()
+                # Symmetrize (PyG dense adj from undirected edge_index already is)
+                mat = ((A + A.t()) > 0).float()
+                print(f"  alpha=0.0: vanilla adjacency (D^(-1/2)(I+A)D^(-1/2) downstream)")
+            else:
+                pp = self.preprocessors[alpha]
+                mat = torch.stack([pp.get_ppr(i) for i in range(N)])  # [N, N]
             if device is not None:
                 self.ppr_dense[alpha] = mat.to(device)
             elif torch.cuda.is_available():
